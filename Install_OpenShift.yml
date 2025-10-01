@@ -15,14 +15,17 @@
     aws_region: "us-east-1"
     cluster_name: "rosa-demo-classic"
 
+    # If set, we'll use a sanitized version as ROSA --domain-prefix (NO random suffix).
+    aws_ec2_ocp_srv_name: "openshift"
+
     # ===== OpenShift version =====
     openshift_version: ""
 
     # ===== Topology / sizing =====
-    multi_az: true
+    multi_az: false
     private: false
     compute_machine_type: "m5.xlarge"
-    compute_replicas: 3
+    compute_replicas: 2
     availability_zones: []
 
     # ===== Tagging (accepts key=value, key:value, or 'key value') =====
@@ -34,17 +37,17 @@
     vpc_stack_name: "rosa-vpc-{{ cluster_name }}"
 
     # ===== Role/link options =====
-    role_prefix: "ManagedOpenShift"           # OCM/user/account roles prefix
-    operator_roles_prefix: "ManagedOpenShift" # (not used with -c; left for future non -c usage)
+    role_prefix: "ManagedOpenShift"
+    operator_roles_prefix: "ManagedOpenShift"  # (not used with -c)
     ocm_role_arn_to_link: ""
-    force_policy_creation: false              # retry account-roles with --force-policy-creation if needed
+    force_policy_creation: false
 
-    # ===== Auth files under /tmp (inside EE; host ./secrets mounted to /tmp) =====
+    # ===== Auth files =====
     token_file: "/tmp/ocm_offline_token.txt"
 
     aws_auth_from_file: true
-    aws_credentials_file: "/tmp/aws_credentials.txt"     # INI or ENV format accepted
-    aws_profile: ""                                      # e.g. "ocp" (optional)
+    aws_credentials_file: "/tmp/aws_credentials.txt"
+    aws_profile: ""
 
     # Optional helper file mirrored into .aws dirs
     aws_profile_txt_src: "/tmp/aws-profile.txt"
@@ -65,6 +68,7 @@
 
     workdir: "./artifacts/{{ cluster_name }}"
     admin_creds_file: "/tmp/cluster-admin-{{ cluster_name }}.txt"
+    kubeconfig_path: "/tmp/kubeconfig-{{ cluster_name }}"
 
     # Waits
     cluster_ready_timeout_m: 150
@@ -106,7 +110,7 @@
             fail_msg: "Missing required CLI (rosa/aws/oc/jq) on control host."
       tags: [always, setup]
 
-    # ------------------------- AWS CREDENTIALS SETUP (HARDENED) -------------------------
+    # ------------------------- AWS CREDENTIALS SETUP -------------------------
     - name: "Stat AWS credentials file in /tmp (if enabled)"
       when: aws_auth_from_file | bool
       ansible.builtin.stat:
@@ -375,7 +379,7 @@
           }}
       tags: [aws_auth]
 
-    # ---- SAFE error strings for AWS auth attempts (avoid attribute errors) ----
+    # ---- SAFE error strings for AWS auth attempts ----
     - name: "Compute DIRECT attempt message"
       when: not ansible_check_mode
       ansible.builtin.set_fact:
@@ -526,7 +530,25 @@
         _tag_list_raw: "{{ (_raw_tags | length > 0) | ternary(_raw_tags.split(','), []) }}"
       tags: [cluster_create]
 
-    - name: "Normalize cluster tags to 'key value' list for ROSA"
+    # Domain prefix (NO random suffix) for ROSA --domain-prefix
+    - name: "Derive domain-prefix for ROSA from aws_ec2_ocp_srv_name (sanitized, no suffix)"
+      when: (aws_ec2_ocp_srv_name | default('') | trim) | length > 0
+      vars:
+        _raw_prefix: "{{ (aws_ec2_ocp_srv_name | default('') | string | lower | trim) }}"
+      ansible.builtin.set_fact:
+        domain_prefix: >-
+          {{
+            (
+              _raw_prefix
+              | regex_replace('[^a-z0-9-]', '-')
+              | regex_replace('-{2,}', '-')
+              | regex_replace('^-+', '')
+              | regex_replace('-+$', '')
+            )[:15]
+          }}
+      tags: [cluster_create]
+
+    - name: "Normalize cluster tags to 'key value' list for ROSA (no implicit Name tag)"
       ansible.builtin.set_fact:
         _tag_list_norm: >-
           {{
@@ -544,10 +566,12 @@
         normalized_tags: "{{ _tag_list_norm | join(',') }}"
       tags: [cluster_create]
 
-    - name: "Debug normalized tags (only visible with -v)"
+    - name: "Debug normalized tags and domain-prefix (only with -v)"
       when: (ansible_verbosity | int) > 0
       ansible.builtin.debug:
-        var: normalized_tags
+        msg:
+          - "normalized_tags='{{ normalized_tags | default('') }}'"
+          - "domain_prefix='{{ domain_prefix | default('') }}'"
       tags: [cluster_create]
 
     - name: "Check if the cluster already exists"
@@ -568,6 +592,7 @@
           --mode auto
           --yes
           --region {{ aws_region }}
+          {% if domain_prefix | default('') | length > 0 %} --domain-prefix {{ domain_prefix }} {% endif %}
           {% if normalized_tags | default('') | length > 0 %} --tags '{{ normalized_tags }}' {% endif %}
           --compute-machine-type {{ compute_machine_type }}
           --replicas {{ compute_replicas }}
@@ -595,10 +620,8 @@
 
     # =================== Cluster-Scoped IAM (idempotent safety) =============
     - name: "Ensure cluster operator-roles exist (auto)"
-      # IMPORTANT: Do NOT pass --prefix when -c <cluster> is used (STS restriction)
       ansible.builtin.command: >
-        {{ rosa_bin }} create operator-roles -c {{ cluster_name }}
-        --mode auto --yes
+        {{ rosa_bin }} create operator-roles -c {{ cluster_name }} --mode auto --yes
       register: create_operator_roles
       changed_when: "'created' in (create_operator_roles.stdout | lower)"
       failed_when: create_operator_roles.rc not in [0]
@@ -663,10 +686,11 @@
       when: not ansible_check_mode and (cluster_desc.stdout | default('') | length > 0)
       ansible.builtin.set_fact:
         cluster_json: "{{ cluster_desc.stdout | from_json }}"
+        api_url: "{{ (cluster_desc.stdout | from_json).api.url | default(omit) }}"
       tags: [wait_ready]
 
-    # ============================ Post-Install ===============================
-    - name: "Create one-time cluster-admin user for initial access"
+    # ============================ Post-Install / HTPasswd login =============
+    - name: "Create one-time cluster-admin user for initial access (creates HTPasswd IDP)"
       when: not ansible_check_mode
       ansible.builtin.command: "{{ rosa_bin }} create admin -c {{ cluster_name }} --yes"
       register: create_admin
@@ -683,17 +707,49 @@
         content: "{{ create_admin.stdout }}"
       tags: [admin_user]
 
-    - name: "Stash admin credentials text for final summary"
+    - name: "Extract cluster-admin password from output"
       when: not ansible_check_mode and (create_admin is defined)
       ansible.builtin.set_fact:
-        admin_creds_text: "{{ create_admin.stdout }}"
+        cluster_admin_password: "{{ (create_admin.stdout | regex_search('(?mi)--password\\s+(\\S+)', '\\1') | default('')) }}"
       tags: [admin_user]
 
-    - name: "Extract API URL for convenience"
-      when: not ansible_check_mode and (cluster_json is defined)
-      ansible.builtin.set_fact:
-        api_url: "{{ cluster_json.api.url }}"
-      tags: [summary]
+    - name: "Wait for HTPasswd IDP to appear"
+      when: not ansible_check_mode
+      ansible.builtin.command: "{{ rosa_bin }} list idps -c {{ cluster_name }} -o json"
+      register: idps_json
+      changed_when: false
+      failed_when: false
+      retries: 20
+      delay: 15
+      until: >
+        (idps_json.stdout | default('') | lower) is search('htpasswd')
+      environment: "{{ aws_env | default(aws_env_files) }}"
+      tags: [admin_user]
+
+    - name: "Attempt oc login with cluster-admin (retry until OAuth ready)"
+      when: not ansible_check_mode
+      ansible.builtin.command: >
+        {{ oc_bin }} login {{ api_url }}
+        --username cluster-admin
+        --password {{ cluster_admin_password }}
+        --insecure-skip-tls-verify=true
+        --kubeconfig {{ kubeconfig_path }}
+      register: oc_login_attempt
+      changed_when: false
+      failed_when: false
+      retries: 20
+      delay: 30
+      until: oc_login_attempt.rc == 0
+      tags: [admin_user]
+
+    - name: "Verify login succeeded (oc whoami)"
+      when: not ansible_check_mode
+      ansible.builtin.command: >
+        {{ oc_bin }} whoami --kubeconfig {{ kubeconfig_path }}
+      register: whoami_out
+      changed_when: false
+      failed_when: whoami_out.rc != 0
+      tags: [admin_user]
 
     - name: "Final summary"
       ansible.builtin.debug:
@@ -702,16 +758,13 @@
           - "AZ topology: {{ 'multi-AZ' if multi_az else 'single-AZ' }}"
           - "Replicas: {{ compute_replicas }} (min required: {{ min_replicas_required }})"
           - >-
-            {% if ansible_check_mode %}
+            {% if ansible_check_mode -%}
             --check mode: identity/readiness/admin steps skipped.
-            {% else %}
+            {%- else -%}
             {% if api_url is defined %}API: {{ api_url }}{% else %}API URL not parsed.{% endif %}
+            {% if domain_prefix | default('') | length > 0 %}Domain prefix: {{ domain_prefix }}{% endif %}
+            Kubeconfig: {{ kubeconfig_path }}
             Admin creds file (sensitive): {{ admin_creds_file }}
-            {% if print_admin_creds and (admin_creds_text is defined) %}
-            ---- Cluster Admin Credentials (sensitive) ----
-            {{ admin_creds_text }}
-            -----------------------------------------------
-            {% endif %}
-            {% endif %}
+            {%- endif %}
       tags: [summary]
 
