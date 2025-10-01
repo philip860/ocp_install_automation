@@ -3,6 +3,9 @@
 #there’s no “single-node” option for Classic. 
 #If you want a 1-node data plane, you need ROSA Hosted Control Plane (HCP) and a single-replica nodepool.
 
+
+### These settings will configure a Single-Node(SNO) In AWS
+
 - name: "Provision ROSA (Classic by default; HCP when requested, supports Single-Node HCP)"
   hosts: localhost
   connection: local
