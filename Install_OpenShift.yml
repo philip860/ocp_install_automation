@@ -1,51 +1,88 @@
 ---
 # Playbook: Install ROSA in Classic (default) or Hosted Control Plane (HCP) mode
-# Check-mode safe:
-#   - Skips AWS-dependent identity/readiness/admin steps in --check
-#   - Runs only what’s safe to validate structure & inputs
+# Secrets under /tmp:
+#   - AWS credentials file: /tmp/aws_credentials.txt
+#   - ROSA offline token:   /tmp/ocm_offline_token.txt
+#   - Admin creds output:   /tmp/cluster-admin-<cluster_name>.txt
+# Includes:
+#   - AWS auth (file/profile/env), early AWS+ROSA login
+#   - Guardrails for worker replicas
+#   - Classic (default) vs HCP via flag
+#   - Check-mode safety
+#   - Final summary prints admin credentials to console
 
 - name: Provision ROSA (Classic by default; HCP when requested)
   hosts: localhost
   connection: local
   gather_facts: false
 
+  # Region env here; credentials added via aws_env later
   environment:
     AWS_REGION: "{{ aws_region }}"
     AWS_DEFAULT_REGION: "{{ aws_region }}"
     AWS_PAGER: ""
 
   vars:
+    ###########################################################################
     # ---------------------------- USER INPUTS --------------------------------
-    hosted_control_plane: false              # false = Classic; true = HCP
+    ###########################################################################
+    # ===== Cluster mode =====
+    hosted_control_plane: false              # false = Classic (non-HCP); true = HCP
+
+    # ===== Region / naming =====
     aws_region: "us-east-1"
     cluster_name: "rosa-demo-classic"
-    openshift_version: ""                    # e.g. "4.16.18"; empty = latest
+
+    # ===== OpenShift version =====
+    openshift_version: ""                    # e.g., "4.16.18"; empty = latest stable
+
+    # ===== Topology / sizing =====
     multi_az: true
     private: false
     compute_machine_type: "m5.xlarge"
     compute_replicas: 3
-    availability_zones: []                   # e.g. ["us-east-1a","us-east-1b","us-east-1c"]
+    availability_zones: []                   # e.g., ["us-east-1a","us-east-1b","us-east-1c"]
+
+    # ===== Tagging =====
     tags: "owner=iam,env=dev"
 
+    # ===== Network (existing or create via ROSA) =====
     subnet_ids: []
     create_vpc: false
     vpc_stack_name: "rosa-vpc-{{ cluster_name }}"
 
-    ocm_role_arn_to_link: ""                 # existing OCM role ARN to link (optional)
+    # ===== OCM/ROSA role/link options =====
+    ocm_role_arn_to_link: ""                 # set to link an existing OCM role; leave empty to skip
 
-    token_file: "./secrets/ocm_offline_token.txt"  # file contains ONLY the token
+    # ===== ROSA auth (offline token) — from /tmp =====
+    token_file: "/tmp/ocm_offline_token.txt"   # file contains ONLY the token, one line
+    # If file missing, falls back to OCM_TOKEN env var.
 
-    workdir: "./artifacts/{{ cluster_name }}"
-    admin_creds_file: "{{ workdir }}/cluster-admin.txt"
+    # ===== AWS auth options (priority: file > profile > host env) =====
+    aws_auth_from_file: true
+    aws_credentials_file: "/tmp/aws_credentials.txt"   # env-style lines (see notes below)
+    use_aws_profile: false
+    aws_profile: ""                                    # profile name if using profile
+
+    # ===== Paths / tools / timeouts =====
+    workdir: "./artifacts/{{ cluster_name }}"          # non-secret logs/outputs
+    admin_creds_file: "/tmp/cluster-admin-{{ cluster_name }}.txt"   # sensitive -> /tmp
     cluster_ready_timeout_m: 90
 
+    # Print admin creds to console in Final summary (set false to suppress)
+    print_admin_creds: true
+
+    # Binaries
     rosa_bin: "rosa"
     aws_bin: "aws"
     oc_bin: "oc"
     jq_bin: "jq"
 
+  ###########################################################################
+  # ---------------------------- PRE-TASKS ----------------------------------
+  ###########################################################################
   pre_tasks:
-    - name: Create artifacts directory (for logs/outputs)
+    - name: Create artifacts directory (for non-secret logs/outputs)
       ansible.builtin.file:
         path: "{{ workdir }}"
         state: directory
@@ -68,13 +105,105 @@
             that: "{{ which_out.results | map(attribute='rc') | list | max == 0 }}"
             fail_msg: "Missing required CLI (rosa/aws/oc/jq) on control host."
 
-    - name: Check for offline token file
+    # ------------------------- AWS CREDENTIALS SETUP -------------------------
+    - name: Stat AWS credentials file in /tmp (if enabled)
+      when: aws_auth_from_file | bool
+      ansible.builtin.stat:
+        path: "{{ aws_credentials_file }}"
+      register: aws_file_stat
+      check_mode: no
+
+    - name: Read AWS credentials file content from /tmp
+      when: aws_auth_from_file | bool and aws_file_stat.stat.exists
+      ansible.builtin.set_fact:
+        aws_file_content: "{{ lookup('file', aws_credentials_file) }}"
+
+    - name: Parse AWS_ACCESS_KEY_ID from /tmp file (if present)
+      when: aws_file_content is defined
+      ansible.builtin.set_fact:
+        aws_access_key_id: "{{ (aws_file_content | regex_search('(?m)^AWS_ACCESS_KEY_ID=(.+)$', '\\1')) | default('') | trim }}"
+
+    - name: Parse AWS_SECRET_ACCESS_KEY from /tmp file (if present)
+      when: aws_file_content is defined
+      ansible.builtin.set_fact:
+        aws_secret_access_key: "{{ (aws_file_content | regex_search('(?m)^AWS_SECRET_ACCESS_KEY=(.+)$', '\\1')) | default('') | trim }}"
+
+    - name: Parse AWS_SESSION_TOKEN from /tmp file (if present, optional)
+      when: aws_file_content is defined
+      ansible.builtin.set_fact:
+        aws_session_token: "{{ (aws_file_content | regex_search('(?m)^AWS_SESSION_TOKEN=(.+)$', '\\1')) | default('') | trim }}"
+
+    - name: Parse AWS_PROFILE from /tmp file (if present, optional)
+      when: aws_file_content is defined
+      ansible.builtin.set_fact:
+        aws_profile_from_file: "{{ (aws_file_content | regex_search('(?m)^AWS_PROFILE=(.+)$', '\\1')) | default('') | trim }}"
+
+    # Build aws_env in simple, sequential steps (no complex Jinja expressions)
+    - name: Initialize aws_env with region/pager defaults
+      ansible.builtin.set_fact:
+        aws_env:
+          AWS_REGION: "{{ aws_region }}"
+          AWS_DEFAULT_REGION: "{{ aws_region }}"
+          AWS_PAGER: ""
+
+    - name: If file provided static keys, merge keys into aws_env
+      when: (aws_auth_from_file | bool) and
+            (aws_access_key_id | default('') | length > 0) and
+            (aws_secret_access_key | default('') | length > 0)
+      ansible.builtin.set_fact:
+        aws_env: "{{ aws_env | combine({'AWS_ACCESS_KEY_ID': aws_access_key_id, 'AWS_SECRET_ACCESS_KEY': aws_secret_access_key}, recursive=True) }}"
+
+    - name: If a session token exists, merge it into aws_env
+      when: aws_session_token | default('') | length > 0
+      ansible.builtin.set_fact:
+        aws_env: "{{ aws_env | combine({'AWS_SESSION_TOKEN': aws_session_token}, recursive=True) }}"
+
+    - name: "Decide effective AWS profile (vars precedence: aws_profile > file)"
+      when: (use_aws_profile | bool) or (aws_profile | length > 0) or (aws_profile_from_file | default('') | length > 0)
+      ansible.builtin.set_fact:
+        effective_aws_profile: "{{ aws_profile if (aws_profile | length > 0) else (aws_profile_from_file | default('')) }}"
+
+    - name: If using a profile and no static keys set, merge profile into aws_env
+      when: (effective_aws_profile is defined) and
+            (aws_env.AWS_ACCESS_KEY_ID is not defined) and
+            (aws_env.AWS_SECRET_ACCESS_KEY is not defined)
+      ansible.builtin.set_fact:
+        aws_env: "{{ aws_env | combine({'AWS_PROFILE': effective_aws_profile}, recursive=True) }}"
+
+    - name: Show selected AWS auth path (debug)
+      when: (ansible_verbosity | int) > 0
+      ansible.builtin.debug:
+        msg:
+          - >-
+            AWS auth source: {{
+              'file(/tmp/aws_credentials.txt)'
+              if ('AWS_ACCESS_KEY_ID' in aws_env)
+              else ('profile:' ~ aws_env.AWS_PROFILE if ('AWS_PROFILE' in aws_env) else 'host-env')
+            }}
+
+    - name: Verify AWS identity (skipped in --check)
+      when: not ansible_check_mode
+      ansible.builtin.command: "{{ aws_bin }} sts get-caller-identity"
+      environment: "{{ aws_env }}"
+      register: aws_identity
+      changed_when: false
+
+    - name: Abort if AWS identity check failed (non-check mode)
+      when: not ansible_check_mode
+      ansible.builtin.assert:
+        that: aws_identity.rc == 0
+        fail_msg: >-
+          AWS credentials are not valid or not discoverable by the CLI.
+          Ensure keys/profile are correct or set aws_auth_from_file/use_aws_profile accordingly.
+
+    # ------------------------- ROSA TOKEN LOGIN ------------------------------
+    - name: Check for offline token file in /tmp
       ansible.builtin.stat:
         path: "{{ token_file }}"
       register: token_stat
       check_mode: no
 
-    - name: Load offline token from file (preferred)
+    - name: Load offline token from /tmp (preferred)
       when: token_stat.stat.exists
       ansible.builtin.set_fact:
         ocm_token: "{{ lookup('file', token_file) | trim }}"
@@ -94,24 +223,14 @@
     - name: Log in to ROSA/OCM with offline token (non-interactive)
       ansible.builtin.command: >
         {{ rosa_bin }} login --token "{{ ocm_token }}"
+      environment: "{{ aws_env }}"
       register: rosa_login
       changed_when: "'Logged in' in rosa_login.stdout or rosa_login.rc == 0"
       check_mode: no
 
-    # ---- Skip AWS-dependent identity check in --check (prevents STS/IMDS errors) ----
-    - name: Confirm ROSA identity (requires AWS creds)  # skipped in --check to avoid your error
-      when: not ansible_check_mode
-      ansible.builtin.command: "{{ rosa_bin }} whoami"
-      register: rosa_whoami
-      changed_when: false
-
-    - name: Abort if login failed (only when identity check ran)
-      when: not ansible_check_mode
-      ansible.builtin.assert:
-        that: rosa_whoami.rc == 0
-        fail_msg: "ROSA identity check failed (ensure AWS credentials are available)."
-
+    ###########################################################################
     # ----------------------------- GUARDRAILS --------------------------------
+    ###########################################################################
     - name: Compute minimum replicas required based on topology
       ansible.builtin.set_fact:
         min_replicas_required: "{{ 3 if multi_az else 2 }}"
@@ -136,6 +255,9 @@
           multi_AZ={{ multi_az }} requires {{ '>= 2 AZs' if multi_az else 'exactly 1 AZ' }},
           but you provided {{ availability_zones | length }}: {{ availability_zones }}.
 
+  ###########################################################################
+  # ------------------------------ TASKS ------------------------------------
+  ###########################################################################
   tasks:
     # ===================== OCM/Account Prereqs (idempotent) =================
     - name: Create OCM admin role if none exists (safe to re-run)
@@ -144,6 +266,7 @@
       register: create_ocm_admin_role
       changed_when: "'created' in (create_ocm_admin_role.stdout | lower)"
       failed_when: create_ocm_admin_role.rc not in [0]
+      environment: "{{ aws_env }}"
 
     - name: Create user role (safe to re-run)
       ansible.builtin.command: >
@@ -151,6 +274,7 @@
       register: create_user_role
       changed_when: "'created' in (create_user_role.stdout | lower)"
       failed_when: create_user_role.rc not in [0]
+      environment: "{{ aws_env }}"
 
     - name: Create account-wide roles and policies (auto mode; idempotent)
       ansible.builtin.command: >
@@ -158,6 +282,7 @@
       register: create_account_roles
       changed_when: "'created' in (create_account_roles.stdout | lower)"
       failed_when: create_account_roles.rc not in [0]
+      environment: "{{ aws_env }}"
 
     - name: Optionally link an existing OCM role to your RH org
       when: ocm_role_arn_to_link | length > 0
@@ -166,6 +291,7 @@
       register: link_ocm_role
       changed_when: "'linked' in (link_ocm_role.stdout | lower)"
       failed_when: link_ocm_role.rc not in [0]
+      environment: "{{ aws_env }}"
 
     # ========================= Optional Network Creation =====================
     - name: Conditionally create a VPC for the cluster
@@ -180,6 +306,7 @@
           register: rosa_network
           changed_when: "'created' in (rosa_network.stdout | lower)"
           failed_when: rosa_network.rc not in [0]
+          environment: "{{ aws_env }}"
 
         - name: Describe VPC to get subnet IDs
           ansible.builtin.command: >
@@ -187,6 +314,7 @@
           register: rosa_network_desc
           changed_when: false
           check_mode: no
+          environment: "{{ aws_env }}"
 
         - name: Save subnet_ids from network stack outputs
           ansible.builtin.set_fact:
@@ -199,6 +327,7 @@
       changed_when: false
       failed_when: false
       check_mode: no
+      environment: "{{ aws_env }}"
 
     - name: Build base cluster create command (shared flags)
       ansible.builtin.set_fact:
@@ -229,6 +358,7 @@
       register: create_cluster
       changed_when: true
       failed_when: create_cluster.rc not in [0]
+      environment: "{{ aws_env }}"
 
     # =================== Cluster-Scoped IAM (idempotent safety) =============
     - name: Ensure cluster operator-roles exist (auto)
@@ -237,6 +367,7 @@
       register: create_operator_roles
       changed_when: "'created' in (create_operator_roles.stdout | lower)"
       failed_when: create_operator_roles.rc not in [0]
+      environment: "{{ aws_env }}"
 
     - name: Ensure cluster OIDC provider exists (auto)
       ansible.builtin.command: >
@@ -244,6 +375,7 @@
       register: create_oidc_provider
       changed_when: "'created' in (create_oidc_provider.stdout | lower)"
       failed_when: create_oidc_provider.rc not in [0]
+      environment: "{{ aws_env }}"
 
     # ============================ Wait for Ready =============================
     - name: Watch install logs until cluster is ready (async)
@@ -257,6 +389,7 @@
       failed_when: false
       async: "{{ watch_seconds }}"
       poll: 15
+      environment: "{{ aws_env }}"
 
     - name: Describe cluster to verify status
       when: not ansible_check_mode
@@ -265,6 +398,7 @@
       changed_when: false
       failed_when: cluster_desc.rc != 0
       check_mode: no
+      environment: "{{ aws_env }}"
 
     - name: Parse cluster JSON (only when we have output)
       when: not ansible_check_mode and (cluster_desc.stdout | default('') | length > 0)
@@ -285,13 +419,19 @@
       register: create_admin
       changed_when: "'created' in (create_admin.stdout | lower) or 'generated' in (create_admin.stdout | lower)"
       failed_when: create_admin.rc not in [0]
+      environment: "{{ aws_env }}"
 
-    - name: Save cluster-admin credentials to file (0600)
+    - name: Save cluster-admin credentials to /tmp (0600)
       when: not ansible_check_mode and (create_admin is defined)
       ansible.builtin.copy:
         dest: "{{ admin_creds_file }}"
         mode: "0600"
         content: "{{ create_admin.stdout }}"
+
+    - name: Stash admin credentials text for final summary
+      when: not ansible_check_mode and (create_admin is defined)
+      ansible.builtin.set_fact:
+        admin_creds_text: "{{ create_admin.stdout }}"
 
     - name: Extract API URL for convenience
       when: not ansible_check_mode and (cluster_json is defined)
@@ -306,8 +446,13 @@
           - "Replicas: {{ compute_replicas }} (min required: {{ min_replicas_required }})"
           - >-
             {% if ansible_check_mode %}
-            --check mode: skipped identity/readiness/admin steps that require AWS credentials.
+            --check mode: identity/readiness/admin steps skipped.
             {% else %}
             {% if api_url is defined %}API: {{ api_url }}{% else %}API URL not parsed.{% endif %}
-            One-time admin creds file: {{ admin_creds_file }}
+            Admin creds file (sensitive): {{ admin_creds_file }}
+            {% if print_admin_creds and (admin_creds_text is defined) %}
+            ---- Cluster Admin Credentials (sensitive) ----
+            {{ admin_creds_text }}
+            -----------------------------------------------
+            {% endif %}
             {% endif %}
