@@ -1,58 +1,40 @@
 ---
 # Playbook: Install ROSA in Classic (default) or Hosted Control Plane (HCP) mode
-# Now with guardrails for minimum replicas based on mode & multi-AZ.
-# Summary:
-#   - Uses an offline token to log in to ROSA/OCM (non-interactive)
-#   - Ensures OCM Admin/User roles and account-wide roles/policies (idempotent)
-#   - Optionally links an existing OCM role ARN to your Red Hat org
-#   - Optionally creates a VPC and captures subnets
-#   - Creates either a Classic cluster (default) or an HCP cluster (when hosted_control_plane=true)
-#   - Enforces minimum worker replicas (fail-fast guardrails)
-#   - Waits for Ready; creates a one-time cluster-admin user
+# Check-mode safe:
+#   - Skips AWS-dependent identity/readiness/admin steps in --check
+#   - Runs only what’s safe to validate structure & inputs
 
 - name: Provision ROSA (Classic by default; HCP when requested)
   hosts: localhost
   connection: local
   gather_facts: false
 
+  environment:
+    AWS_REGION: "{{ aws_region }}"
+    AWS_DEFAULT_REGION: "{{ aws_region }}"
+    AWS_PAGER: ""
+
   vars:
-    ###########################################################################
     # ---------------------------- USER INPUTS --------------------------------
-    ###########################################################################
-    # ===== Cluster mode =====
-    hosted_control_plane: false              # false = Classic (non-HCP); true = HCP
-
-    # ===== Region / naming =====
+    hosted_control_plane: false              # false = Classic; true = HCP
     aws_region: "us-east-1"
-    cluster_name: "rosa-demo-classic"       # change as needed
-
-    # ===== OpenShift version =====
-    openshift_version: ""                    # e.g., "4.16.18"; empty = latest stable
-
-    # ===== Topology / sizing =====
-    multi_az: true                           # spread across multiple AZs
-    private: false                           # private cluster if true (no public endpoints)
+    cluster_name: "rosa-demo-classic"
+    openshift_version: ""                    # e.g. "4.16.18"; empty = latest
+    multi_az: true
+    private: false
     compute_machine_type: "m5.xlarge"
-    compute_replicas: 3                      # will be validated by guardrails
-
-    # Pin AZs if you want; otherwise ROSA will pick suitable ones
-    availability_zones: []                   # e.g., ["us-east-1a","us-east-1b","us-east-1c"]
-
-    # ===== Tagging =====
+    compute_replicas: 3
+    availability_zones: []                   # e.g. ["us-east-1a","us-east-1b","us-east-1c"]
     tags: "owner=iam,env=dev"
 
-    # ===== Network (existing or create via ROSA) =====
-    subnet_ids: []                           # use existing subnets; leave empty to let ROSA choose
-    create_vpc: false                        # true => use "rosa create network" to generate VPC+subnets
+    subnet_ids: []
+    create_vpc: false
     vpc_stack_name: "rosa-vpc-{{ cluster_name }}"
 
-    # ===== OCM/ROSA role/link options =====
-    ocm_role_arn_to_link: ""                 # set to link existing OCM role ARN; leave empty to skip
+    ocm_role_arn_to_link: ""                 # existing OCM role ARN to link (optional)
 
-    # ===== Auth (offline token) =====
-    token_file: "./secrets/ocm_offline_token.txt"  # contains ONLY the token, one line
+    token_file: "./secrets/ocm_offline_token.txt"  # file contains ONLY the token
 
-    # ===== Paths / tools / timeouts =====
     workdir: "./artifacts/{{ cluster_name }}"
     admin_creds_file: "{{ workdir }}/cluster-admin.txt"
     cluster_ready_timeout_m: 90
@@ -62,20 +44,12 @@
     oc_bin: "oc"
     jq_bin: "jq"
 
-  ###########################################################################
-  # ---------------------------- PRE-TASKS ----------------------------------
-  ###########################################################################
   pre_tasks:
     - name: Create artifacts directory (for logs/outputs)
       ansible.builtin.file:
         path: "{{ workdir }}"
         state: directory
         mode: "0750"
-
-    - name: Export AWS region to environment
-      ansible.builtin.set_environment:
-        AWS_REGION: "{{ aws_region }}"
-        AWS_DEFAULT_REGION: "{{ aws_region }}"
 
     - name: Verify required CLIs are installed
       block:
@@ -88,6 +62,7 @@
             - "{{ jq_bin }}"
           register: which_out
           changed_when: false
+          check_mode: no
         - name: Fail if any CLI is missing
           ansible.builtin.assert:
             that: "{{ which_out.results | map(attribute='rc') | list | max == 0 }}"
@@ -97,6 +72,7 @@
       ansible.builtin.stat:
         path: "{{ token_file }}"
       register: token_stat
+      check_mode: no
 
     - name: Load offline token from file (preferred)
       when: token_stat.stat.exists
@@ -120,31 +96,25 @@
         {{ rosa_bin }} login --token "{{ ocm_token }}"
       register: rosa_login
       changed_when: "'Logged in' in rosa_login.stdout or rosa_login.rc == 0"
+      check_mode: no
 
-    - name: Confirm ROSA identity
+    # ---- Skip AWS-dependent identity check in --check (prevents STS/IMDS errors) ----
+    - name: Confirm ROSA identity (requires AWS creds)  # skipped in --check to avoid your error
+      when: not ansible_check_mode
       ansible.builtin.command: "{{ rosa_bin }} whoami"
       register: rosa_whoami
       changed_when: false
 
-    - name: Abort if login failed
+    - name: Abort if login failed (only when identity check ran)
+      when: not ansible_check_mode
       ansible.builtin.assert:
         that: rosa_whoami.rc == 0
-        fail_msg: "ROSA login failed with the provided token."
+        fail_msg: "ROSA identity check failed (ensure AWS credentials are available)."
 
-    ###########################################################################
-    # --------------------------- GUARDRails ----------------------------------
-    ###########################################################################
-    - name: Compute minimum replicas required based on mode and multi-AZ
-      # Rules enforced:
-      #   Classic + single-AZ => min 2
-      #   Classic + multi-AZ  => min 3
-      #   HCP     + single-AZ => min 2
-      #   HCP     + multi-AZ  => min 3
+    # ----------------------------- GUARDRAILS --------------------------------
+    - name: Compute minimum replicas required based on topology
       ansible.builtin.set_fact:
-        min_replicas_required: >-
-          {{
-            (3 if multi_az else 2)
-          }}
+        min_replicas_required: "{{ 3 if multi_az else 2 }}"
 
     - name: Enforce minimum replicas (fail fast with guidance)
       ansible.builtin.assert:
@@ -157,9 +127,6 @@
           Action: increase 'compute_replicas' to at least {{ min_replicas_required }}.
 
     - name: Validate availability_zones count if provided
-      # If AZs are explicitly set:
-      #   - multi-AZ => require at least 2 entries
-      #   - single-AZ => require exactly 1 entry
       when: availability_zones | length > 0
       ansible.builtin.assert:
         that:
@@ -169,9 +136,6 @@
           multi_AZ={{ multi_az }} requires {{ '>= 2 AZs' if multi_az else 'exactly 1 AZ' }},
           but you provided {{ availability_zones | length }}: {{ availability_zones }}.
 
-  ###########################################################################
-  # ------------------------------ TASKS ------------------------------------
-  ###########################################################################
   tasks:
     # ===================== OCM/Account Prereqs (idempotent) =================
     - name: Create OCM admin role if none exists (safe to re-run)
@@ -222,10 +186,11 @@
             {{ rosa_bin }} describe network --stack-name {{ vpc_stack_name }} -o json
           register: rosa_network_desc
           changed_when: false
+          check_mode: no
 
         - name: Save subnet_ids from network stack outputs
           ansible.builtin.set_fact:
-            subnet_ids: "{{ (rosa_network_desc.stdout | from_json).subnet_ids | default(subnet_ids) }}"
+            subnet_ids: "{{ (rosa_network_desc.stdout | default('{}') | from_json).subnet_ids | default(subnet_ids) }}"
 
     # ============================ Cluster Creation ===========================
     - name: Check if the cluster already exists
@@ -233,6 +198,7 @@
       register: existing_cluster
       changed_when: false
       failed_when: false
+      check_mode: no
 
     - name: Build base cluster create command (shared flags)
       ansible.builtin.set_fact:
@@ -253,8 +219,6 @@
           {% if openshift_version|length > 0 %} --version {{ openshift_version }} {% endif %}
 
     - name: Derive final cluster create command for selected mode
-      # Classic (default): *no* --hosted-cp flag.
-      # HCP: add --hosted-cp.
       ansible.builtin.set_fact:
         create_cluster_cmd: >-
           {{ _cluster_cmd_base }}{% if hosted_control_plane %} --hosted-cp{% endif %}
@@ -283,6 +247,7 @@
 
     # ============================ Wait for Ready =============================
     - name: Watch install logs until cluster is ready (async)
+      when: not ansible_check_mode
       vars:
         watch_seconds: "{{ (cluster_ready_timeout_m | int) * 60 }}"
       ansible.builtin.command: >
@@ -294,41 +259,55 @@
       poll: 15
 
     - name: Describe cluster to verify status
+      when: not ansible_check_mode
       ansible.builtin.command: "{{ rosa_bin }} describe cluster -c {{ cluster_name }} -o json"
       register: cluster_desc
       changed_when: false
       failed_when: cluster_desc.rc != 0
+      check_mode: no
+
+    - name: Parse cluster JSON (only when we have output)
+      when: not ansible_check_mode and (cluster_desc.stdout | default('') | length > 0)
+      ansible.builtin.set_fact:
+        cluster_json: "{{ cluster_desc.stdout | from_json }}"
 
     - name: Fail if cluster did not reach 'ready' in time
+      when: not ansible_check_mode and (cluster_json is defined)
       ansible.builtin.assert:
         that:
-          - "(cluster_desc.stdout | from_json).state | lower == 'ready'"
+          - "(cluster_json.state | lower) == 'ready'"
         fail_msg: "Cluster {{ cluster_name }} did not reach 'ready' within {{ cluster_ready_timeout_m }} minutes."
 
     # ============================ Post-Install ===============================
     - name: Create one-time cluster-admin user for initial access
+      when: not ansible_check_mode
       ansible.builtin.command: "{{ rosa_bin }} create admin -c {{ cluster_name }} --yes"
       register: create_admin
       changed_when: "'created' in (create_admin.stdout | lower) or 'generated' in (create_admin.stdout | lower)"
       failed_when: create_admin.rc not in [0]
 
     - name: Save cluster-admin credentials to file (0600)
+      when: not ansible_check_mode and (create_admin is defined)
       ansible.builtin.copy:
         dest: "{{ admin_creds_file }}"
         mode: "0600"
         content: "{{ create_admin.stdout }}"
 
     - name: Extract API URL for convenience
+      when: not ansible_check_mode and (cluster_json is defined)
       ansible.builtin.set_fact:
-        api_url: "{{ (cluster_desc.stdout | from_json).api.url }}"
+        api_url: "{{ cluster_json.api.url }}"
 
     - name: Final summary
       ansible.builtin.debug:
         msg:
-          - "Cluster '{{ cluster_name }}' is Ready in {{ aws_region }}."
           - "Mode: {{ 'Hosted Control Plane (HCP)' if hosted_control_plane else 'Classic (non-HCP)' }}"
           - "AZ topology: {{ 'multi-AZ' if multi_az else 'single-AZ' }}"
-          - "Replicas: {{ compute_replicas }} (min required was {{ min_replicas_required }})"
-          - "API: {{ api_url }}"
-          - "One-time admin creds saved to: {{ admin_creds_file }}"
-          - "Next: add a real IdP (e.g. 'rosa create idp ... -c {{ cluster_name }}'), then 'oc login {{ api_url }}'."
+          - "Replicas: {{ compute_replicas }} (min required: {{ min_replicas_required }})"
+          - >-
+            {% if ansible_check_mode %}
+            --check mode: skipped identity/readiness/admin steps that require AWS credentials.
+            {% else %}
+            {% if api_url is defined %}API: {{ api_url }}{% else %}API URL not parsed.{% endif %}
+            One-time admin creds file: {{ admin_creds_file }}
+            {% endif %}
