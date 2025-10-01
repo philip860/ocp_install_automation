@@ -36,12 +36,11 @@
     # ===== Role/link options =====
     ocm_role_arn_to_link: ""
 
-    # ===== Auth files under /tmp (inside EE; host ./secrets bind-mounted to /tmp) =====
+    # ===== Auth files under /tmp (inside EE; host ./secrets is bind-mounted to /tmp) =====
     token_file: "/tmp/ocm_offline_token.txt"
     aws_auth_from_file: true
-    aws_credentials_file: "/tmp/aws_credentials.txt"     # e.g. ./secrets/aws_credentials.txt on the host
-    aws_profile: ""                                       # set to INI section like "ocp" if you want
-    use_aws_profile: false                                # (kept for compatibility; not required here)
+    aws_credentials_file: "/tmp/aws_credentials.txt"     # INI or ENV format accepted
+    aws_profile: ""                                       # set to an INI section like "ocp" if desired
 
     # Optional helper file to mirror into .aws dirs
     aws_profile_txt_src: "/tmp/aws-profile.txt"
@@ -103,7 +102,7 @@
             fail_msg: "Missing required CLI (rosa/aws/oc/jq) on control host."
       tags: [always, setup]
 
-    # ------------------------- AWS CREDENTIALS SETUP (UPDATED) -------------------------
+    # ------------------------- AWS CREDENTIALS SETUP (HARDENED) -------------------------
     - name: "Stat AWS credentials file in /tmp (if enabled)"
       when: aws_auth_from_file | bool
       ansible.builtin.stat:
@@ -118,79 +117,74 @@
         aws_file_content: "{{ lookup('file', aws_credentials_file) }}"
       tags: [aws_auth]
 
-    - name: "Detect credentials file format (ENV vs INI)"
+    - name: "Discover sections and ENV AWS_PROFILE (if present)"
       when: aws_file_content is defined
       ansible.builtin.set_fact:
-        aws_creds_format: >-
-          {{
-            'env' if (aws_file_content is search('(?mi)^\\s*AWS_ACCESS_KEY_ID\\s*='))
-            else ('ini' if (aws_file_content is search('(?m)^\\s*\\[.+\\]\\s*$'))
-            else 'unknown')
-          }}
+        _sections_list: "{{ aws_file_content | regex_findall('(?m)^\\s*\\[([^\\]]+)\\]\\s*$') }}"
+        _env_profile_raw: "{{ (aws_file_content | regex_findall('(?mi)^\\s*AWS_PROFILE\\s*=\\s*(.+)$') | first | default('')) | trim }}"
       tags: [aws_auth]
 
-    # Try to discover a profile name from file if not provided
-    - name: "Discover profile from file (ENV or INI)"
-      when: aws_file_content is defined
+    - name: "Sanitize provided and discovered profiles"
       ansible.builtin.set_fact:
-        discovered_profile_from_env: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_PROFILE\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
-        discovered_first_ini_section: "{{ (aws_file_content | regex_search('(?m)^\\s*\\[([^\\]]+)\\]\\s*$','\\1') | default('') | trim) }}"
+        _aws_profile_arg: "{{ (aws_profile | default('') | string | trim) }}"
+        _env_profile_clean: "{{ '' if (_env_profile_raw | lower) in ['none','null'] else _env_profile_raw }}"
+        _first_section: "{{ _sections_list | first | default('') }}"
       tags: [aws_auth]
 
-    - name: "Decide effective INI section/profile"
+    - name: "Choose effective AWS profile"
       ansible.builtin.set_fact:
         effective_aws_profile: >-
           {{
-            (aws_profile | trim) if (aws_profile | default('') | trim | length > 0)
-            else (
-              discovered_profile_from_env if (discovered_profile_from_env | length > 0)
-              else (
-                discovered_first_ini_section if (aws_creds_format == 'ini' and discovered_first_ini_section | length > 0)
-                else 'default'
-              )
-            )
+            (_aws_profile_arg if _aws_profile_arg|length>0
+             else (_env_profile_clean if _env_profile_clean|length>0
+             else (_first_section if _first_section|length>0
+             else 'default')))
           }}
       tags: [aws_auth]
 
-    # Parse ENV style (KEY=VALUE) if detected
-    - name: "Parse ENV-style credentials"
-      when: aws_creds_format == 'env'
+    - name: "Parse ENV-style credentials (candidate)"
+      when: aws_file_content is defined
       ansible.builtin.set_fact:
-        _aki_raw: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_ACCESS_KEY_ID\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
-        _sak_raw: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_SECRET_ACCESS_KEY\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
-        _tok_raw: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_SESSION_TOKEN\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
+        _env_aki: "{{ (aws_file_content | regex_findall('(?mi)^\\s*AWS_ACCESS_KEY_ID\\s*=\\s*(.+)$') | first | default('')) | trim }}"
+        _env_sak: "{{ (aws_file_content | regex_findall('(?mi)^\\s*AWS_SECRET_ACCESS_KEY\\s*=\\s*(.+)$') | first | default('')) | trim }}"
+        _env_tok: "{{ (aws_file_content | regex_findall('(?mi)^\\s*AWS_SESSION_TOKEN\\s*=\\s*(.+)$') | first | default('')) | trim }}"
       tags: [aws_auth]
 
-    # Parse INI style ([section]\naws_access_key_id = ...)
-    - name: "Parse INI-style credentials (using ini lookup)"
-      when: aws_creds_format == 'ini'
+    - name: "Parse INI-style credentials (candidate, from chosen profile)"
+      when: aws_file_content is defined
       vars:
         _sec: "{{ effective_aws_profile }}"
       ansible.builtin.set_fact:
-        _aki_raw: "{{ lookup('ini', 'aws_access_key_id section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('') | trim }}"
-        _sak_raw: "{{ lookup('ini', 'aws_secret_access_key section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('') | trim }}"
-        _tok_raw: "{{ lookup('ini', 'aws_session_token section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('') | trim }}"
+        _ini_aki: "{{ (lookup('ini', 'aws_access_key_id section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('')) | trim }}"
+        _ini_sak: "{{ (lookup('ini', 'aws_secret_access_key section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('')) | trim }}"
+        _ini_tok: "{{ (lookup('ini', 'aws_session_token section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('')) | trim }}"
       tags: [aws_auth]
 
-    # Normalize values: treat "None"/"null" as empty
-    - name: "Sanitize parsed AWS values"
+    - name: "Select final AWS creds (prefer INI over ENV)"
       ansible.builtin.set_fact:
-        aws_access_key_id: "{{ '' if (_aki_raw | default('') | lower) in ['none','null',''] else _aki_raw }}"
-        aws_secret_access_key: "{{ '' if (_sak_raw | default('') | lower) in ['none','null',''] else _sak_raw }}"
-        aws_session_token: "{{ '' if (_tok_raw | default('') | lower) in ['none','null',''] else _tok_raw }}"
+        aws_access_key_id: "{{ ( _ini_aki if (_ini_aki | length > 0) else _env_aki ) | trim }}"
+        aws_secret_access_key: "{{ ( _ini_sak if (_ini_sak | length > 0) else _env_sak ) | trim }}"
+        aws_session_token: "{{ ( _ini_tok if (_ini_tok | length > 0) else _env_tok ) | trim }}"
+      tags: [aws_auth]
+
+    - name: "Normalize 'none'/'null' to empty values"
+      ansible.builtin.set_fact:
+        aws_access_key_id: "{{ '' if (aws_access_key_id | lower) in ['none','null',''] else aws_access_key_id }}"
+        aws_secret_access_key: "{{ '' if (aws_secret_access_key | lower) in ['none','null',''] else aws_secret_access_key }}"
+        aws_session_token: "{{ '' if (aws_session_token | lower) in ['none','null'] else aws_session_token }}"
       tags: [aws_auth]
 
     - name: "Debug parsed credentials (masked)"
       when: (ansible_verbosity | int) > 0
       ansible.builtin.debug:
         msg:
-          - "Format: {{ aws_creds_format | default('n/a') }}, Profile: {{ effective_aws_profile }}"
+          - "Effective profile: {{ effective_aws_profile }}"
           - "Key present: {{ 'yes' if (aws_access_key_id | length > 0) else 'no' }}"
           - "Secret present: {{ 'yes' if (aws_secret_access_key | length > 0) else 'no' }}"
           - "Token present: {{ 'yes' if (aws_session_token | length > 0) else 'no' }}"
+          - "INI sections found: {{ _sections_list | default([]) }}"
       tags: [aws_auth]
 
-    # Fail fast if file-based auth requested but no usable keys found
     - name: "Assert AWS keys present when aws_auth_from_file=true"
       when: aws_auth_from_file | bool
       ansible.builtin.assert:
@@ -204,14 +198,13 @@
              [{{ effective_aws_profile }}]
              aws_access_key_id = AKIA...
              aws_secret_access_key = ...
-             # aws_session_token = ...    (optional)
+             # aws_session_token = ... (optional)
           2) ENV:
              AWS_ACCESS_KEY_ID=...
              AWS_SECRET_ACCESS_KEY=...
-             # AWS_SESSION_TOKEN=...      (optional)
+             # AWS_SESSION_TOKEN=... (optional)
       tags: [aws_auth]
 
-    # Create isolated AWS CLI home under /tmp and populate credentials/config
     - name: "Create /tmp AWS CLI home directory"
       ansible.builtin.file:
         path: "{{ aws_cli_home }}"
@@ -238,7 +231,6 @@
       changed_when: false
       tags: [aws_auth]
 
-    # Ensure mirror dirs exist physically (even in --check)
     - name: "Create /runner/.aws when using_ansible_navigator"
       when: using_ansible_navigator | bool
       ansible.builtin.file:
@@ -256,7 +248,6 @@
       check_mode: no
       tags: [aws_auth]
 
-    # Copy /tmp/aws-profile.txt helper if present (optional)
     - name: "Stat /tmp/aws-profile.txt"
       ansible.builtin.stat:
         path: "{{ aws_profile_txt_src }}"
@@ -295,7 +286,6 @@
               output = {{ aws_output }}
       tags: [aws_auth]
 
-    # ----------------- Build candidate envs for subsequent commands -----------
     - name: "Initialize file-based AWS env (base)"
       ansible.builtin.set_fact:
         aws_env_files:
@@ -316,7 +306,7 @@
               'AWS_DEFAULT_REGION': aws_region,
               'AWS_PAGER': '',
               'AWS_ACCESS_KEY_ID': aws_access_key_id,
-              'AWS_SECRET_ACCESS_KEY': aws_secret_access_key,
+              'AWS_SECRET_ACCESS_KEY': aws_secret_access_key
             }
             | combine( {'AWS_SESSION_TOKEN': aws_session_token}, recursive=True )
             if (aws_access_key_id | length > 0 and aws_secret_access_key | length > 0)
@@ -381,18 +371,58 @@
           }}
       tags: [aws_auth]
 
+    # ---- SAFE error strings for AWS auth attempts (avoid attribute errors) ----
+    - name: "Compute DIRECT attempt message"
+      when: not ansible_check_mode
+      ansible.builtin.set_fact:
+        _aws_err_direct: >-
+          {{
+            (aws_id_direct is defined)
+            | ternary(
+                (aws_id_direct.stderr | default(aws_id_direct.stdout | default('n/a')) | string | trim),
+                'n/a'
+              )
+          }}
+      tags: [aws_auth]
+
+    - name: "Compute FILES attempt message"
+      when: not ansible_check_mode
+      ansible.builtin.set_fact:
+        _aws_err_files: >-
+          {{
+            (aws_id_files is defined)
+            | ternary(
+                (aws_id_files.stderr | default(aws_id_files.stdout | default('n/a')) | string | trim),
+                'n/a'
+              )
+          }}
+      tags: [aws_auth]
+
+    - name: "Compute HOST attempt message"
+      when: not ansible_check_mode
+      ansible.builtin.set_fact:
+        _aws_err_host: >-
+          {{
+            (aws_id_host is defined)
+            | ternary(
+                (aws_id_host.stderr | default(aws_id_host.stdout | default('n/a')) | string | trim),
+                'n/a'
+              )
+          }}
+      tags: [aws_auth]
+
     - name: "Abort if no AWS auth method worked (non-check mode)"
       when: not ansible_check_mode
       ansible.builtin.assert:
         that:
           - aws_env is defined
-        fail_msg: >-
+        fail_msg: |-
           No working AWS authentication method found.
           Tried DIRECT env, file-based (/tmp/awscli-{{ cluster_name }} profile={{ effective_aws_profile }}), then host env.
           Last errors:
-          DIRECT: {{ (aws_id_direct.stderr | default(aws_id_direct.stdout) | trim) if (aws_id_direct is defined) else 'n/a' }}
-          FILES: {{ (aws_id_files.stderr | default(aws_id_files.stdout) | trim) if (aws_id_files is defined) else 'n/a' }}
-          HOST:  {{ (aws_id_host.stderr | default(aws_id_host.stdout) | trim) if (aws_id_host is defined) else 'n/a' }}
+          DIRECT: {{ _aws_err_direct }}
+          FILES: {{ _aws_err_files }}
+          HOST:  {{ _aws_err_host }}
       tags: [aws_auth]
 
     # ------------------------- ROSA TOKEN LOGIN ------------------------------
@@ -454,8 +484,7 @@
       tags: [guardrails]
 
   tasks:
-    # (unchanged tasks below) -------------------------------------------------
-
+    # ===================== OCM/Account Prereqs (idempotent) =================
     - name: "Create OCM admin role if none exists (safe to re-run)"
       ansible.builtin.command: >
         {{ rosa_bin }} create ocm-role --admin
@@ -493,6 +522,7 @@
       environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [prereqs]
 
+    # ========================= Optional Network Creation =====================
     - name: "Conditionally create a VPC for the cluster"
       when: create_vpc | bool
       block:
@@ -522,6 +552,7 @@
             subnet_ids: "{{ (rosa_network_desc.stdout | default('{}') | from_json).subnet_ids | default(subnet_ids) }}"
           tags: [network]
 
+    # ============================ Cluster Creation ===========================
     - name: "Check if the cluster already exists"
       ansible.builtin.command: "{{ rosa_bin }} describe cluster -c {{ cluster_name }} -o json"
       register: existing_cluster
@@ -565,6 +596,7 @@
       environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [cluster_create]
 
+    # =================== Cluster-Scoped IAM (idempotent safety) =============
     - name: "Ensure cluster operator-roles exist (auto)"
       ansible.builtin.command: >
         {{ rosa_bin }} create operator-roles -c {{ cluster_name }} --mode auto --yes
@@ -583,6 +615,7 @@
       environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [oidc]
 
+    # ============================ Wait for Ready =============================
     - name: "Compute waiter retries from timeout+interval"
       ansible.builtin.set_fact:
         wait_retries: "{{ ((cluster_ready_timeout_m | int) * 60 // (wait_poll_seconds | int)) | int }}"
@@ -633,6 +666,7 @@
         cluster_json: "{{ cluster_desc.stdout | from_json }}"
       tags: [wait_ready]
 
+    # ============================ Post-Install ===============================
     - name: "Create one-time cluster-admin user for initial access"
       when: not ansible_check_mode
       ansible.builtin.command: "{{ rosa_bin }} create admin -c {{ cluster_name }} --yes"
