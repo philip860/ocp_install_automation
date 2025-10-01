@@ -25,7 +25,7 @@
     compute_replicas: 3
     availability_zones: []
 
-    # ===== Tagging =====
+    # ===== Tagging (accepts key=value, key:value, or 'key value') =====
     tags: "owner=iam,env=dev"
 
     # ===== Network =====
@@ -34,15 +34,19 @@
     vpc_stack_name: "rosa-vpc-{{ cluster_name }}"
 
     # ===== Role/link options =====
+    role_prefix: "ManagedOpenShift"           # OCM/user/account roles prefix
+    operator_roles_prefix: "ManagedOpenShift" # (not used with -c; left for future non -c usage)
     ocm_role_arn_to_link: ""
+    force_policy_creation: false              # retry account-roles with --force-policy-creation if needed
 
-    # ===== Auth files under /tmp (inside EE; host ./secrets is bind-mounted to /tmp) =====
+    # ===== Auth files under /tmp (inside EE; host ./secrets mounted to /tmp) =====
     token_file: "/tmp/ocm_offline_token.txt"
+
     aws_auth_from_file: true
     aws_credentials_file: "/tmp/aws_credentials.txt"     # INI or ENV format accepted
-    aws_profile: ""                                       # set to an INI section like "ocp" if desired
+    aws_profile: ""                                      # e.g. "ocp" (optional)
 
-    # Optional helper file to mirror into .aws dirs
+    # Optional helper file mirrored into .aws dirs
     aws_profile_txt_src: "/tmp/aws-profile.txt"
     tmp_aws_dir: "/tmp/.aws"
     tmp_profile_txt_dest: "{{ tmp_aws_dir }}/aws-profile.txt"
@@ -484,44 +488,6 @@
       tags: [guardrails]
 
   tasks:
-    # ===================== OCM/Account Prereqs (idempotent) =================
-    - name: "Create OCM admin role if none exists (safe to re-run)"
-      ansible.builtin.command: >
-        {{ rosa_bin }} create ocm-role --admin
-      register: create_ocm_admin_role
-      changed_when: "'created' in (create_ocm_admin_role.stdout | lower)"
-      failed_when: create_ocm_admin_role.rc not in [0]
-      environment: "{{ aws_env | default(aws_env_files) }}"
-      tags: [prereqs]
-
-    - name: "Create user role (safe to re-run)"
-      ansible.builtin.command: >
-        {{ rosa_bin }} create user-role
-      register: create_user_role
-      changed_when: "'created' in (create_user_role.stdout | lower)"
-      failed_when: create_user_role.rc not in [0]
-      environment: "{{ aws_env | default(aws_env_files) }}"
-      tags: [prereqs]
-
-    - name: "Create account-wide roles and policies (auto mode; idempotent)"
-      ansible.builtin.command: >
-        {{ rosa_bin }} create account-roles --mode auto --yes --region {{ aws_region }}
-      register: create_account_roles
-      changed_when: "'created' in (create_account_roles.stdout | lower)"
-      failed_when: create_account_roles.rc not in [0]
-      environment: "{{ aws_env | default(aws_env_files) }}"
-      tags: [prereqs]
-
-    - name: "Optionally link an existing OCM role to your RH org"
-      when: ocm_role_arn_to_link | length > 0
-      ansible.builtin.command: >
-        {{ rosa_bin }} link ocm-role {{ ocm_role_arn_to_link }}
-      register: link_ocm_role
-      changed_when: "'linked' in (link_ocm_role.stdout | lower)"
-      failed_when: link_ocm_role.rc not in [0]
-      environment: "{{ aws_env | default(aws_env_files) }}"
-      tags: [prereqs]
-
     # ========================= Optional Network Creation =====================
     - name: "Conditionally create a VPC for the cluster"
       when: create_vpc | bool
@@ -553,6 +519,37 @@
           tags: [network]
 
     # ============================ Cluster Creation ===========================
+    - name: "Normalize cluster tags input (split raw)"
+      vars:
+        _raw_tags: "{{ (tags | default('') | string | trim) }}"
+      ansible.builtin.set_fact:
+        _tag_list_raw: "{{ (_raw_tags | length > 0) | ternary(_raw_tags.split(','), []) }}"
+      tags: [cluster_create]
+
+    - name: "Normalize cluster tags to 'key value' list for ROSA"
+      ansible.builtin.set_fact:
+        _tag_list_norm: >-
+          {{
+            _tag_list_raw
+            | map('regex_replace', '[:=]', ' ')
+            | map('regex_replace', '\\s+', ' ')
+            | map('regex_replace', '^\\s+|\\s+$', '')
+            | reject('equalto', '')
+            | list
+          }}
+      tags: [cluster_create]
+
+    - name: "Build normalized tag string 'key value[,key value]...'"
+      ansible.builtin.set_fact:
+        normalized_tags: "{{ _tag_list_norm | join(',') }}"
+      tags: [cluster_create]
+
+    - name: "Debug normalized tags (only visible with -v)"
+      when: (ansible_verbosity | int) > 0
+      ansible.builtin.debug:
+        var: normalized_tags
+      tags: [cluster_create]
+
     - name: "Check if the cluster already exists"
       ansible.builtin.command: "{{ rosa_bin }} describe cluster -c {{ cluster_name }} -o json"
       register: existing_cluster
@@ -571,7 +568,7 @@
           --mode auto
           --yes
           --region {{ aws_region }}
-          --tags "{{ tags }}"
+          {% if normalized_tags | default('') | length > 0 %} --tags '{{ normalized_tags }}' {% endif %}
           --compute-machine-type {{ compute_machine_type }}
           --replicas {{ compute_replicas }}
           {% if private %} --private {% endif %}
@@ -598,8 +595,10 @@
 
     # =================== Cluster-Scoped IAM (idempotent safety) =============
     - name: "Ensure cluster operator-roles exist (auto)"
+      # IMPORTANT: Do NOT pass --prefix when -c <cluster> is used (STS restriction)
       ansible.builtin.command: >
-        {{ rosa_bin }} create operator-roles -c {{ cluster_name }} --mode auto --yes
+        {{ rosa_bin }} create operator-roles -c {{ cluster_name }}
+        --mode auto --yes
       register: create_operator_roles
       changed_when: "'created' in (create_operator_roles.stdout | lower)"
       failed_when: create_operator_roles.rc not in [0]
@@ -715,3 +714,4 @@
             {% endif %}
             {% endif %}
       tags: [summary]
+
