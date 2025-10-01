@@ -10,37 +10,45 @@
     AWS_PAGER: ""
 
   vars:
+    # ===== Cluster mode / naming =====
     hosted_control_plane: false
     aws_region: "us-east-1"
     cluster_name: "rosa-demo-classic"
 
+    # ===== OpenShift version =====
     openshift_version: ""
 
+    # ===== Topology / sizing =====
     multi_az: true
     private: false
     compute_machine_type: "m5.xlarge"
     compute_replicas: 3
     availability_zones: []
 
+    # ===== Tagging =====
     tags: "owner=iam,env=dev"
 
+    # ===== Network =====
     subnet_ids: []
     create_vpc: false
     vpc_stack_name: "rosa-vpc-{{ cluster_name }}"
 
+    # ===== Role/link options =====
     ocm_role_arn_to_link: ""
 
+    # ===== Auth files under /tmp (inside EE; host ./secrets bind-mounted to /tmp) =====
     token_file: "/tmp/ocm_offline_token.txt"
     aws_auth_from_file: true
-    aws_credentials_file: "/tmp/aws_credentials.txt"
-    use_aws_profile: false
-    aws_profile: ""
+    aws_credentials_file: "/tmp/aws_credentials.txt"     # e.g. ./secrets/aws_credentials.txt on the host
+    aws_profile: ""                                       # set to INI section like "ocp" if you want
+    use_aws_profile: false                                # (kept for compatibility; not required here)
 
     # Optional helper file to mirror into .aws dirs
     aws_profile_txt_src: "/tmp/aws-profile.txt"
     tmp_aws_dir: "/tmp/.aws"
     tmp_profile_txt_dest: "{{ tmp_aws_dir }}/aws-profile.txt"
 
+    # ===== Where the EE writes AWS CLI config/credentials =====
     aws_cli_home: "/tmp/awscli-{{ cluster_name }}"
     aws_credentials_out: "{{ aws_cli_home }}/credentials"
     aws_config_out: "{{ aws_cli_home }}/config"
@@ -55,6 +63,7 @@
     workdir: "./artifacts/{{ cluster_name }}"
     admin_creds_file: "/tmp/cluster-admin-{{ cluster_name }}.txt"
 
+    # Waits
     cluster_ready_timeout_m: 150
     wait_poll_seconds: 60
     logs_tail: 200
@@ -62,6 +71,7 @@
 
     print_admin_creds: true
 
+    # Binaries
     rosa_bin: "rosa"
     aws_bin: "aws"
     oc_bin: "oc"
@@ -93,7 +103,7 @@
             fail_msg: "Missing required CLI (rosa/aws/oc/jq) on control host."
       tags: [always, setup]
 
-    # ------------------------- AWS CREDENTIALS SETUP -------------------------
+    # ------------------------- AWS CREDENTIALS SETUP (UPDATED) -------------------------
     - name: "Stat AWS credentials file in /tmp (if enabled)"
       when: aws_auth_from_file | bool
       ansible.builtin.stat:
@@ -108,54 +118,100 @@
         aws_file_content: "{{ lookup('file', aws_credentials_file) }}"
       tags: [aws_auth]
 
-    - name: "Parse AWS_ACCESS_KEY_ID from /tmp file (if present)"
+    - name: "Detect credentials file format (ENV vs INI)"
       when: aws_file_content is defined
       ansible.builtin.set_fact:
-        aws_access_key_id: "{{ (aws_file_content | regex_search('(?m)^AWS_ACCESS_KEY_ID=(.+)$', '\\1')) | default('') | trim }}"
-      tags: [aws_auth]
-
-    - name: "Parse AWS_SECRET_ACCESS_KEY from /tmp file (if present)"
-      when: aws_file_content is defined
-      ansible.builtin.set_fact:
-        aws_secret_access_key: "{{ (aws_file_content | regex_search('(?m)^AWS_SECRET_ACCESS_KEY=(.+)$', '\\1')) | default('') | trim }}"
-      tags: [aws_auth]
-
-    - name: "Parse AWS_SESSION_TOKEN from /tmp file (if present, optional)"
-      when: aws_file_content is defined
-      ansible.builtin.set_fact:
-        aws_session_token: "{{ (aws_file_content | regex_search('(?m)^AWS_SESSION_TOKEN=(.+)$', '\\1')) | default('') | trim }}"
-      tags: [aws_auth]
-
-    - name: "Parse AWS_PROFILE from /tmp file (if present, optional)"
-      when: aws_file_content is defined
-      ansible.builtin.set_fact:
-        aws_profile_from_file: "{{ (aws_file_content | regex_search('(?m)^AWS_PROFILE=(.+)$', '\\1')) | default('') | trim }}"
-      tags: [aws_auth]
-
-    # Normalize profile (avoid 'None'/'null')
-    - name: "Normalize profile inputs (strip 'None'/'null') - gather raw"
-      ansible.builtin.set_fact:
-        _aws_profile_raw: "{{ (aws_profile | default('') | string | trim) }}"
-        _aws_profile_file_raw: "{{ (aws_profile_from_file | default('') | string | trim) }}"
-      tags: [aws_auth]
-
-    - name: "Normalize profile inputs (strip 'None'/'null') - compute cleaned"
-      ansible.builtin.set_fact:
-        aws_profile_clean: "{{ '' if (_aws_profile_raw | lower) in ['none','null'] else _aws_profile_raw }}"
-        aws_profile_from_file_clean: "{{ '' if (_aws_profile_file_raw | lower) in ['none','null'] else _aws_profile_file_raw }}"
-      tags: [aws_auth]
-
-    - name: "Decide effective AWS profile (precedence: aws_profile > file > default)"
-      ansible.builtin.set_fact:
-        effective_aws_profile: >-
+        aws_creds_format: >-
           {{
-            (aws_profile_clean if (aws_profile_clean | length > 0)
-             else (aws_profile_from_file_clean if (aws_profile_from_file_clean | length > 0)
-             else 'default'))
+            'env' if (aws_file_content is search('(?mi)^\\s*AWS_ACCESS_KEY_ID\\s*='))
+            else ('ini' if (aws_file_content is search('(?m)^\\s*\\[.+\\]\\s*$'))
+            else 'unknown')
           }}
       tags: [aws_auth]
 
-    # Create isolated AWS CLI home under /tmp and populate credentials/config if keys exist
+    # Try to discover a profile name from file if not provided
+    - name: "Discover profile from file (ENV or INI)"
+      when: aws_file_content is defined
+      ansible.builtin.set_fact:
+        discovered_profile_from_env: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_PROFILE\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
+        discovered_first_ini_section: "{{ (aws_file_content | regex_search('(?m)^\\s*\\[([^\\]]+)\\]\\s*$','\\1') | default('') | trim) }}"
+      tags: [aws_auth]
+
+    - name: "Decide effective INI section/profile"
+      ansible.builtin.set_fact:
+        effective_aws_profile: >-
+          {{
+            (aws_profile | trim) if (aws_profile | default('') | trim | length > 0)
+            else (
+              discovered_profile_from_env if (discovered_profile_from_env | length > 0)
+              else (
+                discovered_first_ini_section if (aws_creds_format == 'ini' and discovered_first_ini_section | length > 0)
+                else 'default'
+              )
+            )
+          }}
+      tags: [aws_auth]
+
+    # Parse ENV style (KEY=VALUE) if detected
+    - name: "Parse ENV-style credentials"
+      when: aws_creds_format == 'env'
+      ansible.builtin.set_fact:
+        _aki_raw: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_ACCESS_KEY_ID\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
+        _sak_raw: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_SECRET_ACCESS_KEY\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
+        _tok_raw: "{{ (aws_file_content | regex_search('(?mi)^\\s*AWS_SESSION_TOKEN\\s*=\\s*(.+)$','\\1') | default('') | trim) }}"
+      tags: [aws_auth]
+
+    # Parse INI style ([section]\naws_access_key_id = ...)
+    - name: "Parse INI-style credentials (using ini lookup)"
+      when: aws_creds_format == 'ini'
+      vars:
+        _sec: "{{ effective_aws_profile }}"
+      ansible.builtin.set_fact:
+        _aki_raw: "{{ lookup('ini', 'aws_access_key_id section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('') | trim }}"
+        _sak_raw: "{{ lookup('ini', 'aws_secret_access_key section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('') | trim }}"
+        _tok_raw: "{{ lookup('ini', 'aws_session_token section=' ~ _sec ~ ' file=' ~ aws_credentials_file) | default('') | trim }}"
+      tags: [aws_auth]
+
+    # Normalize values: treat "None"/"null" as empty
+    - name: "Sanitize parsed AWS values"
+      ansible.builtin.set_fact:
+        aws_access_key_id: "{{ '' if (_aki_raw | default('') | lower) in ['none','null',''] else _aki_raw }}"
+        aws_secret_access_key: "{{ '' if (_sak_raw | default('') | lower) in ['none','null',''] else _sak_raw }}"
+        aws_session_token: "{{ '' if (_tok_raw | default('') | lower) in ['none','null',''] else _tok_raw }}"
+      tags: [aws_auth]
+
+    - name: "Debug parsed credentials (masked)"
+      when: (ansible_verbosity | int) > 0
+      ansible.builtin.debug:
+        msg:
+          - "Format: {{ aws_creds_format | default('n/a') }}, Profile: {{ effective_aws_profile }}"
+          - "Key present: {{ 'yes' if (aws_access_key_id | length > 0) else 'no' }}"
+          - "Secret present: {{ 'yes' if (aws_secret_access_key | length > 0) else 'no' }}"
+          - "Token present: {{ 'yes' if (aws_session_token | length > 0) else 'no' }}"
+      tags: [aws_auth]
+
+    # Fail fast if file-based auth requested but no usable keys found
+    - name: "Assert AWS keys present when aws_auth_from_file=true"
+      when: aws_auth_from_file | bool
+      ansible.builtin.assert:
+        that:
+          - aws_access_key_id | length > 0
+          - aws_secret_access_key | length > 0
+        fail_msg: >-
+          aws_auth_from_file=true but {{ aws_credentials_file }} did not contain usable keys.
+          Supported formats:
+          1) INI:
+             [{{ effective_aws_profile }}]
+             aws_access_key_id = AKIA...
+             aws_secret_access_key = ...
+             # aws_session_token = ...    (optional)
+          2) ENV:
+             AWS_ACCESS_KEY_ID=...
+             AWS_SECRET_ACCESS_KEY=...
+             # AWS_SESSION_TOKEN=...      (optional)
+      tags: [aws_auth]
+
+    # Create isolated AWS CLI home under /tmp and populate credentials/config
     - name: "Create /tmp AWS CLI home directory"
       ansible.builtin.file:
         path: "{{ aws_cli_home }}"
@@ -163,31 +219,26 @@
         mode: "0700"
       tags: [aws_auth]
 
-    - name: "Write AWS credentials file (from keys in /tmp)"
-      when:
-        - aws_access_key_id | default('') | length > 0
-        - aws_secret_access_key | default('') | length > 0
-      ansible.builtin.copy:
-        dest: "{{ aws_credentials_out }}"
-        mode: "0600"
-        content: |-
-          [{{ effective_aws_profile }}]
-          aws_access_key_id={{ aws_access_key_id }}
-          aws_secret_access_key={{ aws_secret_access_key }}{% if aws_session_token | default('') | length > 0 %}
-          aws_session_token={{ aws_session_token }}{% endif %}
+    - name: "Materialize AWS config/credentials via aws configure set"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        export AWS_CONFIG_FILE="{{ aws_config_out }}"
+        export AWS_SHARED_CREDENTIALS_FILE="{{ aws_credentials_out }}"
+        mkdir -p "$(dirname "$AWS_CONFIG_FILE")"
+        mkdir -p "$(dirname "$AWS_SHARED_CREDENTIALS_FILE")"
+        {{ aws_bin }} configure set region "{{ aws_region }}" --profile "{{ effective_aws_profile }}"
+        {{ aws_bin }} configure set output "{{ aws_output }}" --profile "{{ effective_aws_profile }}"
+        {{ aws_bin }} configure set aws_access_key_id "{{ aws_access_key_id }}" --profile "{{ effective_aws_profile }}"
+        {{ aws_bin }} configure set aws_secret_access_key "{{ aws_secret_access_key }}" --profile "{{ effective_aws_profile }}"
+        {% if aws_session_token | length > 0 %}
+        {{ aws_bin }} configure set aws_session_token "{{ aws_session_token }}" --profile "{{ effective_aws_profile }}"
+        {% endif %}
+      args:
+        executable: /bin/bash
+      changed_when: false
       tags: [aws_auth]
 
-    - name: "Write AWS config file (region/output)"
-      ansible.builtin.copy:
-        dest: "{{ aws_config_out }}"
-        mode: "0600"
-        content: |-
-          [profile {{ effective_aws_profile }}]
-          region = {{ aws_region }}
-          output = {{ aws_output }}
-      tags: [aws_auth]
-
-    # --- Create mirror dirs with check_mode: no so copies won't fail in --check ---
+    # Ensure mirror dirs exist physically (even in --check)
     - name: "Create /runner/.aws when using_ansible_navigator"
       when: using_ansible_navigator | bool
       ansible.builtin.file:
@@ -205,34 +256,7 @@
       check_mode: no
       tags: [aws_auth]
 
-    # --- Mirror credentials/config into /runner/.aws when requested ---
-    - name: "Mirror credentials to /runner/.aws/credentials (if keys exist)"
-      when:
-        - using_ansible_navigator | bool
-        - aws_access_key_id | default('') | length > 0
-        - aws_secret_access_key | default('') | length > 0
-      ansible.builtin.copy:
-        dest: "{{ runner_credentials_out }}"
-        mode: "0600"
-        content: |-
-          [{{ effective_aws_profile }}]
-          aws_access_key_id={{ aws_access_key_id }}
-          aws_secret_access_key={{ aws_secret_access_key }}{% if aws_session_token | default('') | length > 0 %}
-          aws_session_token={{ aws_session_token }}{% endif %}
-      tags: [aws_auth]
-
-    - name: "Mirror config to /runner/.aws/config"
-      when: using_ansible_navigator | bool
-      ansible.builtin.copy:
-        dest: "{{ runner_config_out }}"
-        mode: "0600"
-        content: |-
-          [profile {{ effective_aws_profile }}]
-          region = {{ aws_region }}
-          output = {{ aws_output }}
-      tags: [aws_auth]
-
-    # --- Copy /tmp/aws-profile.txt into both .aws dirs when present ---
+    # Copy /tmp/aws-profile.txt helper if present (optional)
     - name: "Stat /tmp/aws-profile.txt"
       ansible.builtin.stat:
         path: "{{ aws_profile_txt_src }}"
@@ -249,38 +273,58 @@
         remote_src: true
       tags: [aws_auth]
 
-    - name: "Copy aws-profile.txt into /runner/.aws/ (navigator)"
-      when: using_ansible_navigator | bool and aws_profile_txt_stat.stat.exists
-      ansible.builtin.copy:
-        src: "{{ aws_profile_txt_src }}"
-        dest: "{{ runner_profile_txt_dest }}"
-        mode: "0600"
-        remote_src: true
+    - name: "Mirror credentials/config to /runner/.aws (navigator)"
+      when: using_ansible_navigator | bool
+      block:
+        - name: "Mirror credentials to /runner/.aws/credentials"
+          ansible.builtin.copy:
+            dest: "{{ runner_credentials_out }}"
+            mode: "0600"
+            content: |-
+              [{{ effective_aws_profile }}]
+              aws_access_key_id={{ aws_access_key_id }}
+              aws_secret_access_key={{ aws_secret_access_key }}{% if aws_session_token | length > 0 %}
+              aws_session_token={{ aws_session_token }}{% endif %}
+        - name: "Mirror config to /runner/.aws/config"
+          ansible.builtin.copy:
+            dest: "{{ runner_config_out }}"
+            mode: "0600"
+            content: |-
+              [profile {{ effective_aws_profile }}]
+              region = {{ aws_region }}
+              output = {{ aws_output }}
       tags: [aws_auth]
 
-    # Base env that always points at our /tmp files (explicit & highest precedence)
-    - name: "Initialize base AWS env pointing to /tmp files"
+    # ----------------- Build candidate envs for subsequent commands -----------
+    - name: "Initialize file-based AWS env (base)"
       ansible.builtin.set_fact:
-        aws_base_env:
+        aws_env_files:
           AWS_REGION: "{{ aws_region }}"
           AWS_DEFAULT_REGION: "{{ aws_region }}"
           AWS_PAGER: ""
           AWS_SHARED_CREDENTIALS_FILE: "{{ aws_credentials_out }}"
           AWS_CONFIG_FILE: "{{ aws_config_out }}"
+          AWS_PROFILE: "{{ effective_aws_profile }}"
       tags: [aws_auth]
 
-    - name: "Add AWS_PROFILE to env only when valid"
-      when: effective_aws_profile | length > 0
+    - name: "Initialize DIRECT env (keys directly) if keys present"
       ansible.builtin.set_fact:
-        aws_base_env: "{{ aws_base_env | combine({'AWS_PROFILE': effective_aws_profile}, recursive=True) }}"
+        aws_env_direct: >-
+          {{
+            {
+              'AWS_REGION': aws_region,
+              'AWS_DEFAULT_REGION': aws_region,
+              'AWS_PAGER': '',
+              'AWS_ACCESS_KEY_ID': aws_access_key_id,
+              'AWS_SECRET_ACCESS_KEY': aws_secret_access_key,
+            }
+            | combine( {'AWS_SESSION_TOKEN': aws_session_token}, recursive=True )
+            if (aws_access_key_id | length > 0 and aws_secret_access_key | length > 0)
+            else {}
+          }}
       tags: [aws_auth]
 
-    - name: "Build candidate env: materialized /tmp credentials/profile"
-      ansible.builtin.set_fact:
-        aws_env_keys_or_profile: "{{ aws_base_env }}"
-      tags: [aws_auth]
-
-    - name: "Build candidate env: host environment (fallback)"
+    - name: "Initialize HOST env (fallback)"
       ansible.builtin.set_fact:
         aws_env_host:
           AWS_REGION: "{{ aws_region }}"
@@ -288,39 +332,32 @@
           AWS_PAGER: ""
       tags: [aws_auth]
 
-    - name: "Compute primary auth source and fallbacks (prefer /tmp materialized)"
-      ansible.builtin.set_fact:
-        aws_primary_env: "{{ aws_env_keys_or_profile }}"
-        aws_primary_name: "tmp-files"
-        aws_fallback1_env: "{{ aws_env_host }}"
-        aws_fallback1_name: "host"
-      tags: [aws_auth]
-
-    - name: "Show selected AWS auth candidates (debug)"
-      when: (ansible_verbosity | int) > 0
-      ansible.builtin.debug:
-        msg:
-          - "Primary AWS auth: {{ aws_primary_name }} ({{ aws_credentials_out }}, {{ aws_config_out }}, profile={{ effective_aws_profile }})"
-          - "Fallback1: {{ aws_fallback1_name }}"
-          - "Navigator mirror: {{ 'on' if (using_ansible_navigator | bool) else 'off' }} -> {{ runner_aws_dir }}"
-          - "aws-profile.txt present: {{ 'yes' if (aws_profile_txt_stat.stat.exists) else 'no' }}"
-      tags: [aws_auth]
-
-    # ------------------------- Verify AWS identity with fallback -------------
-    - name: "Try AWS identity with PRIMARY env (/tmp materialized) (skipped in --check)"
-      when: not ansible_check_mode
+    - name: "Try AWS identity: DIRECT env (skipped in --check)"
+      when: not ansible_check_mode and (aws_env_direct | length > 0)
       ansible.builtin.command: "{{ aws_bin }} sts get-caller-identity"
-      environment: "{{ aws_primary_env }}"
-      register: aws_identity_primary
+      environment: "{{ aws_env_direct }}"
+      register: aws_id_direct
       changed_when: false
       failed_when: false
       tags: [aws_auth]
 
-    - name: "Try AWS identity with FALLBACK1 env (host) if primary failed"
-      when: not ansible_check_mode and (aws_identity_primary.rc != 0)
+    - name: "Try AWS identity: FILE env with explicit --profile (skipped in --check)"
+      when: not ansible_check_mode and ((aws_id_direct is not defined) or (aws_id_direct.rc != 0))
+      ansible.builtin.command: "{{ aws_bin }} sts get-caller-identity --profile {{ effective_aws_profile }}"
+      environment: "{{ aws_env_files }}"
+      register: aws_id_files
+      changed_when: false
+      failed_when: false
+      tags: [aws_auth]
+
+    - name: "Try AWS identity: HOST env (last resort) (skipped in --check)"
+      when: not ansible_check_mode and (
+              (aws_id_direct is not defined or aws_id_direct.rc != 0) and
+              (aws_id_files is not defined or aws_id_files.rc != 0)
+            )
       ansible.builtin.command: "{{ aws_bin }} sts get-caller-identity"
-      environment: "{{ aws_fallback1_env }}"
-      register: aws_identity_fb1
+      environment: "{{ aws_env_host }}"
+      register: aws_id_host
       changed_when: false
       failed_when: false
       tags: [aws_auth]
@@ -330,15 +367,17 @@
       ansible.builtin.set_fact:
         aws_env: >-
           {{
-            (aws_primary_env if (aws_identity_primary.rc == 0)
-             else (aws_fallback1_env if (aws_identity_fb1 is defined and aws_identity_fb1.rc == 0)
-             else omit))
+            (aws_env_direct if (aws_id_direct is defined and aws_id_direct.rc == 0)
+             else (aws_env_files if (aws_id_files is defined and aws_id_files.rc == 0)
+             else (aws_env_host if (aws_id_host is defined and aws_id_host.rc == 0)
+             else omit)))
           }}
         aws_env_source: >-
           {{
-            (aws_primary_name if (aws_identity_primary.rc == 0)
-             else ('host' if (aws_identity_fb1 is defined and aws_identity_fb1.rc == 0)
-             else 'none'))
+            ('direct' if (aws_id_direct is defined and aws_id_direct.rc == 0)
+             else ('files' if (aws_id_files is defined and aws_id_files.rc == 0)
+             else ('host' if (aws_id_host is defined and aws_id_host.rc == 0)
+             else 'none')))
           }}
       tags: [aws_auth]
 
@@ -349,20 +388,11 @@
           - aws_env is defined
         fail_msg: >-
           No working AWS authentication method found.
-          Tried (in order): {{ aws_primary_name }}, {{ aws_fallback1_name }}.
-          Last error:
-          {% if aws_identity_fb1 is defined %}
-            {{ aws_identity_fb1.stderr | default(aws_identity_fb1.stdout) | trim }}
-          {% else %}
-            {{ aws_identity_primary.stderr | default(aws_identity_primary.stdout) | trim }}
-          {% endif %}
-      tags: [aws_auth]
-
-    - name: "Confirm chosen AWS auth method (debug)"
-      when: (ansible_verbosity | int) > 0 and not ansible_check_mode
-      ansible.builtin.debug:
-        msg:
-          - "Using AWS auth source: {{ aws_env_source }}"
+          Tried DIRECT env, file-based (/tmp/awscli-{{ cluster_name }} profile={{ effective_aws_profile }}), then host env.
+          Last errors:
+          DIRECT: {{ (aws_id_direct.stderr | default(aws_id_direct.stdout) | trim) if (aws_id_direct is defined) else 'n/a' }}
+          FILES: {{ (aws_id_files.stderr | default(aws_id_files.stdout) | trim) if (aws_id_files is defined) else 'n/a' }}
+          HOST:  {{ (aws_id_host.stderr | default(aws_id_host.stdout) | trim) if (aws_id_host is defined) else 'n/a' }}
       tags: [aws_auth]
 
     # ------------------------- ROSA TOKEN LOGIN ------------------------------
@@ -396,7 +426,7 @@
     - name: "Log in to ROSA/OCM with offline token (non-interactive)"
       ansible.builtin.command: >
         {{ rosa_bin }} login --token "{{ ocm_token }}"
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       register: rosa_login
       changed_when: "'Logged in' in rosa_login.stdout or rosa_login.rc == 0"
       check_mode: no
@@ -424,14 +454,15 @@
       tags: [guardrails]
 
   tasks:
-    # ===================== OCM/Account Prereqs (idempotent) =================
+    # (unchanged tasks below) -------------------------------------------------
+
     - name: "Create OCM admin role if none exists (safe to re-run)"
       ansible.builtin.command: >
         {{ rosa_bin }} create ocm-role --admin
       register: create_ocm_admin_role
       changed_when: "'created' in (create_ocm_admin_role.stdout | lower)"
       failed_when: create_ocm_admin_role.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [prereqs]
 
     - name: "Create user role (safe to re-run)"
@@ -440,7 +471,7 @@
       register: create_user_role
       changed_when: "'created' in (create_user_role.stdout | lower)"
       failed_when: create_user_role.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [prereqs]
 
     - name: "Create account-wide roles and policies (auto mode; idempotent)"
@@ -449,7 +480,7 @@
       register: create_account_roles
       changed_when: "'created' in (create_account_roles.stdout | lower)"
       failed_when: create_account_roles.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [prereqs]
 
     - name: "Optionally link an existing OCM role to your RH org"
@@ -459,10 +490,9 @@
       register: link_ocm_role
       changed_when: "'linked' in (link_ocm_role.stdout | lower)"
       failed_when: link_ocm_role.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [prereqs]
 
-    # ========================= Optional Network Creation =====================
     - name: "Conditionally create a VPC for the cluster"
       when: create_vpc | bool
       block:
@@ -475,7 +505,7 @@
           register: rosa_network
           changed_when: "'created' in (rosa_network.stdout | lower)"
           failed_when: rosa_network.rc not in [0]
-          environment: "{{ aws_env | default(aws_base_env) }}"
+          environment: "{{ aws_env | default(aws_env_files) }}"
           tags: [network]
 
         - name: "Describe VPC to get subnet IDs"
@@ -484,7 +514,7 @@
           register: rosa_network_desc
           changed_when: false
           check_mode: no
-          environment: "{{ aws_env | default(aws_base_env) }}"
+          environment: "{{ aws_env | default(aws_env_files) }}"
           tags: [network]
 
         - name: "Save subnet_ids from network stack outputs"
@@ -492,14 +522,13 @@
             subnet_ids: "{{ (rosa_network_desc.stdout | default('{}') | from_json).subnet_ids | default(subnet_ids) }}"
           tags: [network]
 
-    # ============================ Cluster Creation ===========================
     - name: "Check if the cluster already exists"
       ansible.builtin.command: "{{ rosa_bin }} describe cluster -c {{ cluster_name }} -o json"
       register: existing_cluster
       changed_when: false
       failed_when: false
       check_mode: no
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [cluster_create]
 
     - name: "Build base cluster create command (shared flags)"
@@ -533,17 +562,16 @@
       register: create_cluster
       changed_when: true
       failed_when: create_cluster.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [cluster_create]
 
-    # =================== Cluster-Scoped IAM (idempotent safety) =============
     - name: "Ensure cluster operator-roles exist (auto)"
       ansible.builtin.command: >
         {{ rosa_bin }} create operator-roles -c {{ cluster_name }} --mode auto --yes
       register: create_operator_roles
       changed_when: "'created' in (create_operator_roles.stdout | lower)"
       failed_when: create_operator_roles.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [operator_roles]
 
     - name: "Ensure cluster OIDC provider exists (auto)"
@@ -552,10 +580,9 @@
       register: create_oidc_provider
       changed_when: "'created' in (create_oidc_provider.stdout | lower)"
       failed_when: create_oidc_provider.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [oidc]
 
-    # ============================ Wait for Ready =============================
     - name: "Compute waiter retries from timeout+interval"
       ansible.builtin.set_fact:
         wait_retries: "{{ ((cluster_ready_timeout_m | int) * 60 // (wait_poll_seconds | int)) | int }}"
@@ -572,7 +599,7 @@
       failed_when: false
       async: "{{ watch_seconds }}"
       poll: "{{ logs_poll_seconds }}"
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [wait_ready]
 
     - name: "Wait until cluster state is 'ready'"
@@ -587,7 +614,7 @@
         (cluster_desc_wait.stdout is defined) and
         (cluster_desc_wait.stdout | length > 0) and
         ((cluster_desc_wait.stdout | from_json).state | lower == 'ready')
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [wait_ready]
 
     - name: "Final describe (parse for summary)"
@@ -597,7 +624,7 @@
       changed_when: false
       failed_when: cluster_desc.rc != 0
       check_mode: no
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [wait_ready]
 
     - name: "Parse cluster JSON (only when we have output)"
@@ -606,14 +633,13 @@
         cluster_json: "{{ cluster_desc.stdout | from_json }}"
       tags: [wait_ready]
 
-    # ============================ Post-Install ===============================
     - name: "Create one-time cluster-admin user for initial access"
       when: not ansible_check_mode
       ansible.builtin.command: "{{ rosa_bin }} create admin -c {{ cluster_name }} --yes"
       register: create_admin
       changed_when: "'created' in (create_admin.stdout | lower) or 'generated' in (create_admin.stdout | lower)"
       failed_when: create_admin.rc not in [0]
-      environment: "{{ aws_env | default(aws_base_env) }}"
+      environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [admin_user]
 
     - name: "Save cluster-admin credentials to /tmp (0600)"
