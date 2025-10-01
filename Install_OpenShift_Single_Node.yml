@@ -3,7 +3,7 @@
 #there’s no “single-node” option for Classic. 
 #If you want a 1-node data plane, you need ROSA Hosted Control Plane (HCP) and a single-replica nodepool.
 
-- name: "Provision ROSA (Classic by default; HCP when requested)"
+- name: "Provision ROSA (Classic by default; HCP when requested, supports Single-Node HCP)"
   hosts: localhost
   connection: local
   gather_facts: false
@@ -15,25 +15,26 @@
 
   vars:
     # ===== Cluster mode / naming =====
-    hosted_control_plane: false
+    hosted_control_plane: false          # set true for HCP (required for 1-node)
+    single_node: false                   # set true (with HCP) to allow 1 worker
     aws_region: "us-east-1"
     cluster_name: "rosa-demo-classic"
 
-    # If set, we'll use a sanitized version as ROSA --domain-prefix (NO random suffix).
-    aws_ec2_ocp_srv_name: "openshift"
+    # Optional DNS prefix seed for --domain-prefix (no random suffix).
+    aws_ec2_ocp_srv_name: ""
 
     # ===== OpenShift version =====
     openshift_version: ""
 
     # ===== Topology / sizing =====
-    multi_az: false
+    multi_az: true                       # set false for single-node HCP
     private: false
-    compute_machine_type: "m5.xlarge"
-    compute_replicas: 2
-    availability_zones: []
+    compute_machine_type: "m5.xlarge"    # Classic create flag; for HCP used as nodepool --instance-type
+    compute_replicas: 3                  # For Classic: worker count. For HCP: nodepool replicas (set 1 for single-node)
+    availability_zones: []               # For HCP single-node, typically 1 AZ (first element used for nodepool if provided)
 
     # ===== Tagging (accepts key=value, key:value, or 'key value') =====
-    tags: "owner=iam,env=dev"
+    tags: "owner=iam,env=dev"            # We won't inject any implicit Name tag
 
     # ===== Network =====
     subnet_ids: []
@@ -357,7 +358,7 @@
               (aws_id_direct is not defined or aws_id_direct.rc != 0) and
               (aws_id_files is not defined or aws_id_files.rc != 0)
             )
-      ansible.builtin.command: "{{ aws_bin }} sts get-caller-identity"
+      ansible.builtin.command: "{{ aws_bin }} sts get-caller-identity }}"
       environment: "{{ aws_env_host }}"
       register: aws_id_host
       changed_when: false
@@ -475,16 +476,30 @@
       tags: [rosa_auth]
 
     # ----------------------------- GUARDRAILS --------------------------------
-    - name: "Compute minimum replicas required based on topology"
+    - name: "Compute minimum replicas required based on topology & mode"
       ansible.builtin.set_fact:
-        min_replicas_required: "{{ 3 if multi_az else 2 }}"
+        min_replicas_required: >-
+          {{
+            1 if (hosted_control_plane | bool) and (single_node | bool) and not (multi_az | bool)
+            else (3 if (multi_az | bool) else 2)
+          }}
+      tags: [guardrails]
+
+    - name: "Assert single-node constraints (HCP-only)"
+      when: single_node | bool
+      ansible.builtin.assert:
+        that:
+          - hosted_control_plane | bool
+          - not multi_az | bool
+          - (compute_replicas | int) == 1
+        fail_msg: "Single-node requires HCP, single-AZ, and compute_replicas: 1."
       tags: [guardrails]
 
     - name: "Enforce minimum replicas (fail fast with guidance)"
       ansible.builtin.assert:
         that:
           - (compute_replicas | int) >= (min_replicas_required | int)
-        fail_msg: "Invalid 'compute_replicas' for topology; need >= {{ min_replicas_required }}."
+        fail_msg: "Invalid 'compute_replicas' for this topology/mode; need >= {{ min_replicas_required }}."
       tags: [guardrails]
 
     - name: "Validate availability_zones count if provided"
@@ -534,7 +549,6 @@
         _tag_list_raw: "{{ (_raw_tags | length > 0) | ternary(_raw_tags.split(','), []) }}"
       tags: [cluster_create]
 
-    # Domain prefix (NO random suffix) for ROSA --domain-prefix
     - name: "Derive domain-prefix for ROSA from aws_ec2_ocp_srv_name (sanitized, no suffix)"
       when: (aws_ec2_ocp_srv_name | default('') | trim) | length > 0
       vars:
@@ -598,8 +612,8 @@
           --region {{ aws_region }}
           {% if domain_prefix | default('') | length > 0 %} --domain-prefix {{ domain_prefix }} {% endif %}
           {% if normalized_tags | default('') | length > 0 %} --tags '{{ normalized_tags }}' {% endif %}
-          --compute-machine-type {{ compute_machine_type }}
-          --replicas {{ compute_replicas }}
+          {% if not hosted_control_plane %} --compute-machine-type {{ compute_machine_type }} {% endif %}
+          {% if not hosted_control_plane %} --replicas {{ compute_replicas }} {% endif %}
           {% if private %} --private {% endif %}
           {% if multi_az %} --multi-az {% endif %}
           {% if availability_zones|length > 0 %} --availability-zones {{ availability_zones | join(',') }} {% endif %}
@@ -640,6 +654,49 @@
       failed_when: create_oidc_provider.rc not in [0]
       environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [oidc]
+
+    # ============================ HCP Nodepool (workers) =====================
+    - name: "If HCP: ensure a nodepool exists at desired size (e.g., 1 for single-node)"
+      when: hosted_control_plane | bool
+      block:
+        - name: "List nodepools"
+          ansible.builtin.command: "{{ rosa_bin }} list nodepools -c {{ cluster_name }} -o json"
+          register: nodepools_json
+          changed_when: false
+          failed_when: false
+          environment: "{{ aws_env | default(aws_env_files) }}"
+        - name: "Compute whether a nodepool exists"
+          ansible.builtin.set_fact:
+            _nodepools: "{{ (nodepools_json.stdout | default('[]')) | from_json | list }}"
+            _have_np: "{{ ((nodepools_json.stdout | default('[]')) | from_json | list | length) > 0 }}"
+        - name: "Create a nodepool if none exists"
+          when: not _have_np
+          ansible.builtin.command: >
+            {{ rosa_bin }} create nodepool
+            -c {{ cluster_name }}
+            --name default
+            --replicas {{ compute_replicas }}
+            --instance-type {{ compute_machine_type }}
+            {% if availability_zones|length > 0 %} --availability-zone {{ availability_zones[0] }} {% endif %}
+            {% if subnet_ids|length > 0 %} --subnet-ids {{ subnet_ids | join(',') }} {% endif %}
+          register: create_np
+          changed_when: create_np.rc == 0
+          failed_when: create_np.rc not in [0]
+          environment: "{{ aws_env | default(aws_env_files) }}"
+        - name: "If a nodepool exists, scale it to desired replicas (idempotent)"
+          when: _have_np
+          vars:
+            _np_name: "{{ (_nodepools[0].name | default('default')) if (_nodepools|length>0) else 'default' }}"
+          ansible.builtin.command: >
+            {{ rosa_bin }} edit nodepool
+            -c {{ cluster_name }}
+            --replicas {{ compute_replicas }}
+            {{ _np_name }}
+          register: scale_np
+          changed_when: "'Updated' in (scale_np.stdout | default(''))"
+          failed_when: scale_np.rc not in [0]
+          environment: "{{ aws_env | default(aws_env_files) }}"
+      tags: [nodepool]
 
     # ============================ Wait for Ready =============================
     - name: "Compute waiter retries from timeout+interval"
@@ -759,8 +816,9 @@
       ansible.builtin.debug:
         msg:
           - "Mode: {{ 'Hosted Control Plane (HCP)' if hosted_control_plane else 'Classic (non-HCP)' }}"
+          - "Single-node requested: {{ single_node }}"
           - "AZ topology: {{ 'multi-AZ' if multi_az else 'single-AZ' }}"
-          - "Replicas: {{ compute_replicas }} (min required: {{ min_replicas_required }})"
+          - "Replicas requested: {{ compute_replicas }} (min required: {{ min_replicas_required }})"
           - >-
             {% if ansible_check_mode -%}
             --check mode: identity/readiness/admin steps skipped.
@@ -771,4 +829,3 @@
             Admin creds file (sensitive): {{ admin_creds_file }}
             {%- endif %}
       tags: [summary]
-
