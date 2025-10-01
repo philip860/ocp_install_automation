@@ -1,0 +1,318 @@
+---
+# Playbook: Install ROSA in Classic (default) or Hosted Control Plane (HCP) mode
+# Summary:
+#   - Uses an offline token to log in to ROSA/OCM (non-interactive)
+#   - Ensures OCM Admin/User roles and account-wide roles/policies (idempotent)
+#   - Optionally links an existing OCM role ARN to your Red Hat org
+#   - Optionally creates a VPC and captures subnets
+#   - Creates either a Classic cluster (default) or an HCP cluster (when hosted_control_plane=true)
+#   - Waits for Ready; creates a one-time cluster-admin user
+# Notes:
+#   - Classic vs HCP differ at *cluster creation* time; the rest of the prep is mostly the same.
+#   - Classic is selected by *omitting* --hosted-cp. HCP requires --hosted-cp.
+
+- name: Provision ROSA (Classic by default; HCP when requested)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    ###########################################################################
+    # ---------------------------- USER INPUTS --------------------------------
+    ###########################################################################
+    # ===== Cluster mode =====
+    hosted_control_plane: false              # false = Classic (non-HCP); true = HCP
+
+    # ===== Region / naming =====
+    aws_region: "us-east-1"
+    cluster_name: "rosa-demo-classic"       # change as needed
+
+    # ===== OpenShift version =====
+    openshift_version: ""                    # e.g., "4.16.18"; empty = latest stable
+
+    # ===== Topology / sizing =====
+    multi_az: true                           # implies spreading across multiple AZs (Classic/HCP supported)
+    private: false                           # private cluster if true (no public endpoints)
+    compute_machine_type: "m5.xlarge"
+    compute_replicas: 3                      # HCP & Classic both accept --replicas
+
+    # If you want to pin AZs; otherwise ROSA will pick suitable ones
+    availability_zones: []                   # e.g., ["us-east-1a","us-east-1b","us-east-1c"]
+
+    # ===== Tagging =====
+    tags: "owner=iam,env=dev"
+
+    # ===== Network (existing or create via ROSA) =====
+    subnet_ids: []                           # use existing subnets; leave empty to let ROSA choose
+    create_vpc: false                        # true => use "rosa create network" to generate VPC+subnets
+    vpc_stack_name: "rosa-vpc-{{ cluster_name }}"
+
+    # ===== OCM/ROSA role/link options =====
+    # If you already have an OCM role and simply need to link it to your RH org, set its ARN here.
+    # Leave empty to skip linking step.
+    ocm_role_arn_to_link: ""                 # e.g., "arn:aws:iam::123456789012:role/ManagedOpenShift-OCM-Role"
+
+    # ===== Auth (offline token) =====
+    token_file: "./secrets/ocm_offline_token.txt"  # contains ONLY the token, one line
+    # If file missing, falls back to OCM_TOKEN env var.
+
+    # ===== Paths / tools / timeouts =====
+    workdir: "./artifacts/{{ cluster_name }}"
+    admin_creds_file: "{{ workdir }}/cluster-admin.txt"
+    cluster_ready_timeout_m: 90              # allow longer for Classic if you like
+
+    rosa_bin: "rosa"
+    aws_bin: "aws"
+    oc_bin: "oc"
+    jq_bin: "jq"
+
+  ###########################################################################
+  # ---------------------------- PRE-TASKS ----------------------------------
+  ###########################################################################
+  pre_tasks:
+    - name: Create artifacts directory (for logs/outputs)
+      # We’ll stash outputs (e.g., admin creds) here.
+      ansible.builtin.file:
+        path: "{{ workdir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Export AWS region to environment
+      # Ensures downstream CLIs don’t fail with “AWS region not set”.
+      ansible.builtin.set_environment:
+        AWS_REGION: "{{ aws_region }}"
+        AWS_DEFAULT_REGION: "{{ aws_region }}"
+
+    - name: Verify required CLIs are installed
+      # We need rosa/aws/oc/jq on the control machine.
+      block:
+        - name: which (rosa/aws/oc/jq)
+          ansible.builtin.command: "which {{ item }}"
+          loop:
+            - "{{ rosa_bin }}"
+            - "{{ aws_bin }}"
+            - "{{ oc_bin }}"
+            - "{{ jq_bin }}"
+          register: which_out
+          changed_when: false
+        - name: Fail if any CLI is missing
+          ansible.builtin.assert:
+            that: "{{ which_out.results | map(attribute='rc') | list | max == 0 }}"
+            fail_msg: "Missing required CLI (rosa/aws/oc/jq) on control host."
+
+    - name: Check for offline token file
+      # Prefer reading from file; if missing, we’ll try env.
+      ansible.builtin.stat:
+        path: "{{ token_file }}"
+      register: token_stat
+
+    - name: Load offline token from file (preferred)
+      when: token_stat.stat.exists
+      ansible.builtin.set_fact:
+        ocm_token: "{{ lookup('file', token_file) | trim }}"
+
+    - name: Fallback to OCM_TOKEN environment variable
+      when: not token_stat.stat.exists
+      ansible.builtin.set_fact:
+        ocm_token: "{{ lookup('env', 'OCM_TOKEN') | trim }}"
+
+    - name: Assert a token is available for ROSA login
+      # Hard-stop early if no token is available.
+      ansible.builtin.assert:
+        that:
+          - ocm_token is defined
+          - ocm_token | length > 0
+        fail_msg: "No offline token found. Put it in {{ token_file }} or export OCM_TOKEN."
+
+    - name: Log in to ROSA/OCM with offline token (non-interactive)
+      # This authenticates subsequent ROSA commands.
+      ansible.builtin.command: >
+        {{ rosa_bin }} login --token "{{ ocm_token }}"
+      register: rosa_login
+      changed_when: "'Logged in' in rosa_login.stdout or rosa_login.rc == 0"
+
+    - name: Confirm ROSA identity
+      # Sanity check that login succeeded.
+      ansible.builtin.command: "{{ rosa_bin }} whoami"
+      register: rosa_whoami
+      changed_when: false
+
+    - name: Abort if login failed
+      ansible.builtin.assert:
+        that: rosa_whoami.rc == 0
+        fail_msg: "ROSA login failed with the provided token."
+
+  ###########################################################################
+  # ------------------------------ TASKS ------------------------------------
+  ###########################################################################
+  tasks:
+    # ===================== OCM/Account Prereqs (idempotent) =================
+    - name: Create OCM admin role if none exists (safe to re-run)
+      # Creates an admin OCM role for organization-level operations.
+      # If it already exists, ROSA typically no-ops.
+      ansible.builtin.command: >
+        {{ rosa_bin }} create ocm-role --admin
+      register: create_ocm_admin_role
+      changed_when: "'created' in (create_ocm_admin_role.stdout | lower)"
+      failed_when: create_ocm_admin_role.rc not in [0]
+
+    - name: Create user role (safe to re-run)
+      # Creates the user role used by the authenticated user.
+      ansible.builtin.command: >
+        {{ rosa_bin }} create user-role
+      register: create_user_role
+      changed_when: "'created' in (create_user_role.stdout | lower)"
+      failed_when: create_user_role.rc not in [0]
+
+    - name: Create account-wide roles and policies (auto mode; idempotent)
+      # This sets up the AWS account roles/policies that ROSA needs.
+      ansible.builtin.command: >
+        {{ rosa_bin }} create account-roles --mode auto --yes --region {{ aws_region }}
+      register: create_account_roles
+      changed_when: "'created' in (create_account_roles.stdout | lower)"
+      failed_when: create_account_roles.rc not in [0]
+
+    - name: Optionally link an existing OCM role to your RH org
+      # If you’ve provided an ARN for an existing role, link it here.
+      when: ocm_role_arn_to_link | length > 0
+      ansible.builtin.command: >
+        {{ rosa_bin }} link ocm-role {{ ocm_role_arn_to_link }}
+      register: link_ocm_role
+      changed_when: "'linked' in (link_ocm_role.stdout | lower)"
+      failed_when: link_ocm_role.rc not in [0]
+
+    # ========================= Optional Network Creation =====================
+    - name: Conditionally create a VPC for the cluster
+      # When enabled, creates a CFN stack and we’ll capture subnet IDs.
+      when: create_vpc | bool
+      block:
+        - name: Create VPC via 'rosa create network' (idempotent)
+          ansible.builtin.command: >
+            {{ rosa_bin }} create network
+            --yes
+            --region {{ aws_region }}
+            --stack-name {{ vpc_stack_name }}
+          register: rosa_network
+          changed_when: "'created' in (rosa_network.stdout | lower)"
+          failed_when: rosa_network.rc not in [0]
+
+        - name: Describe VPC to get subnet IDs
+          ansible.builtin.command: >
+            {{ rosa_bin }} describe network --stack-name {{ vpc_stack_name }} -o json
+          register: rosa_network_desc
+          changed_when: false
+
+        - name: Save subnet_ids from network stack outputs
+          ansible.builtin.set_fact:
+            subnet_ids: "{{ (rosa_network_desc.stdout | from_json).subnet_ids | default(subnet_ids) }}"
+
+    # ============================ Cluster Creation ===========================
+    - name: Check if the cluster already exists
+      # Keeps the playbook idempotent if you re-run it.
+      ansible.builtin.command: "{{ rosa_bin }} describe cluster -c {{ cluster_name }} -o json"
+      register: existing_cluster
+      changed_when: false
+      failed_when: false
+
+    - name: Build base cluster create command (shared flags)
+      # Common arguments both Classic and HCP will use.
+      ansible.builtin.set_fact:
+        _cluster_cmd_base: >-
+          {{ rosa_bin }} create cluster
+          --cluster-name {{ cluster_name }}
+          --sts
+          --mode auto
+          --yes
+          --region {{ aws_region }}
+          --tags "{{ tags }}"
+          --compute-machine-type {{ compute_machine_type }}
+          --replicas {{ compute_replicas }}
+          {% if private %} --private {% endif %}
+          {% if multi_az %} --multi-az {% endif %}
+          {% if availability_zones|length > 0 %} --availability-zones {{ availability_zones | join(',') }} {% endif %}
+          {% if subnet_ids|length > 0 %} --subnet-ids {{ subnet_ids | join(',') }} {% endif %}
+          {% if openshift_version|length > 0 %} --version {{ openshift_version }} {% endif %}
+
+    - name: Derive final cluster create command for selected mode
+      # Classic (default): *no* --hosted-cp flag.
+      # HCP: add --hosted-cp.
+      ansible.builtin.set_fact:
+        create_cluster_cmd: >-
+          {{ _cluster_cmd_base }}{% if hosted_control_plane %} --hosted-cp{% endif %}
+
+    - name: Create the cluster if it does not exist yet
+      # Executes the proper create command for Classic or HCP based on the flag.
+      when: existing_cluster.rc != 0
+      ansible.builtin.command: "{{ create_cluster_cmd }}"
+      register: create_cluster
+      changed_when: true
+      failed_when: create_cluster.rc not in [0]
+
+    # =================== Cluster-Scoped IAM (idempotent safety) =============
+    - name: Ensure cluster operator-roles exist (auto)
+      # Both Classic and HCP require operator roles; auto mode is idempotent.
+      ansible.builtin.command: >
+        {{ rosa_bin }} create operator-roles -c {{ cluster_name }} --mode auto --yes
+      register: create_operator_roles
+      changed_when: "'created' in (create_operator_roles.stdout | lower)"
+      failed_when: create_operator_roles.rc not in [0]
+
+    - name: Ensure cluster OIDC provider exists (auto)
+      # Creates or confirms the OIDC provider for the cluster.
+      ansible.builtin.command: >
+        {{ rosa_bin }} create oidc-provider -c {{ cluster_name }} --mode auto --yes
+      register: create_oidc_provider
+      changed_when: "'created' in (create_oidc_provider.stdout | lower)"
+      failed_when: create_oidc_provider.rc not in [0]
+
+    # ============================ Wait for Ready =============================
+    - name: Watch install logs until cluster is ready (async)
+      # Classic usually takes longer than HCP; adjust timeout above as needed.
+      vars:
+        watch_seconds: "{{ (cluster_ready_timeout_m | int) * 60 }}"
+      ansible.builtin.command: >
+        {{ rosa_bin }} logs install -c {{ cluster_name }} --watch --tail=100
+      register: install_watch
+      changed_when: false
+      failed_when: false
+      async: "{{ watch_seconds }}"
+      poll: 15
+
+    - name: Describe cluster to verify status
+      ansible.builtin.command: "{{ rosa_bin }} describe cluster -c {{ cluster_name }} -o json"
+      register: cluster_desc
+      changed_when: false
+      failed_when: cluster_desc.rc != 0
+
+    - name: Fail if cluster did not reach 'ready' in time
+      ansible.builtin.assert:
+        that:
+          - "(cluster_desc.stdout | from_json).state | lower == 'ready'"
+        fail_msg: "Cluster {{ cluster_name }} did not reach 'ready' within {{ cluster_ready_timeout_m }} minutes."
+
+    # ============================ Post-Install ===============================
+    - name: Create one-time cluster-admin user for initial access
+      # This prints a temp password; configure a proper IdP next.
+      ansible.builtin.command: "{{ rosa_bin }} create admin -c {{ cluster_name }} --yes"
+      register: create_admin
+      changed_when: "'created' in (create_admin.stdout | lower) or 'generated' in (create_admin.stdout | lower)"
+      failed_when: create_admin.rc not in [0]
+
+    - name: Save cluster-admin credentials to file (0600)
+      ansible.builtin.copy:
+        dest: "{{ admin_creds_file }}"
+        mode: "0600"
+        content: "{{ create_admin.stdout }}"
+
+    - name: Extract API URL for convenience
+      ansible.builtin.set_fact:
+        api_url: "{{ (cluster_desc.stdout | from_json).api.url }}"
+
+    - name: Final summary
+      ansible.builtin.debug:
+        msg:
+          - "Cluster '{{ cluster_name }}' is Ready in {{ aws_region }}."
+          - "Mode: {{ 'Hosted Control Plane (HCP)' if hosted_control_plane else 'Classic (non-HCP)' }}"
+          - "API: {{ api_url }}"
+          - "One-time admin creds saved to: {{ admin_creds_file }}"
+          - "Next: add a real IdP (e.g. 'rosa create idp ... -c {{ cluster_name }}'), then 'oc login {{ api_url }}'."
