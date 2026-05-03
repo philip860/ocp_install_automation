@@ -497,7 +497,7 @@
         executable: /bin/bash
       register: rosa_login
       changed_when: false
-      no_log: true
+      no_log: false
       environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [rosa_auth]
 
