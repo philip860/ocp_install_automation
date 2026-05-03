@@ -497,7 +497,7 @@
         executable: /bin/bash
       register: rosa_login
       changed_when: false
-      no_log: false
+      no_log: true
       environment: "{{ aws_env | default(aws_env_files) }}"
       tags: [rosa_auth]
 
@@ -536,9 +536,16 @@
           --cluster-name {{ cluster_name }}
           --region {{ aws_region }}
           --compute-machine-type {{ compute_machine_type }}
-          --compute-nodes {{ compute_replicas }}
-          --role-arn {{ ocm_role_arn_to_link if (ocm_role_arn_to_link | length > 0) else '' }}
+          --replicas {{ compute_replicas }}
           --yes
+      tags: [create_cluster]
+
+    - name: "Append Role ARN only when provided"
+      when: ocm_role_arn_to_link | default('') | string | trim | length > 0
+      ansible.builtin.set_fact:
+        rosa_create_cmd: >-
+          {{ rosa_create_cmd }}
+          --role-arn {{ ocm_role_arn_to_link | string | trim }}
       tags: [create_cluster]
 
     - name: "Append common ROSA create options"
